@@ -27,7 +27,7 @@ import tempfile
 import time
 from typing import Iterable, Sequence
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CHUNK_SIZE = 1024 * 1024
 DEFAULT_EXCLUDES = (
     ".git",
@@ -461,25 +461,87 @@ def _hash_compiler_environment(
     return _canonical_hash(records), manifest
 
 
-def _artifact_signature(path: Path) -> tuple[int, int, int]:
-    stat = path.stat()
-    return (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+def _artifact_signature(path: Path) -> tuple:
+    # lstat() describes the directory entry itself instead of following a
+    # symlink. A symlink may be a required build product (protobuf's `protoc`
+    # is one such case), so it must participate in artifact discovery.
+    stat = path.lstat()
+    if path.is_symlink():
+        return (
+            "symlink",
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+            os.readlink(path),
+        )
+    return ("file", stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
 
-def _snapshot(root: Path) -> dict[str, tuple[int, int, int]]:
-    snapshot: dict[str, tuple[int, int, int]] = {}
+def _snapshot(root: Path) -> dict[str, tuple]:
+    snapshot: dict[str, tuple] = {}
     if not root.exists():
         return snapshot
 
     for path in sorted(root.rglob("*")):
-        if path.is_file() and not path.is_symlink():
+        if path.is_symlink() or path.is_file():
             snapshot[path.relative_to(root).as_posix()] = _artifact_signature(path)
     return snapshot
 
 
+def _internal_symlink_target(root: Path, link: Path) -> Path | None:
+    target = Path(os.readlink(link))
+    if target.is_absolute():
+        candidate = target
+    else:
+        candidate = link.parent / target
+
+    root_abs = Path(os.path.abspath(root))
+    candidate_abs = Path(os.path.abspath(os.path.normpath(candidate)))
+    try:
+        relative = candidate_abs.relative_to(root_abs)
+    except ValueError:
+        return None
+    return root_abs / relative
+
+
+def _expand_internal_symlink_targets(
+    root: Path,
+    selected: set[str],
+) -> set[str]:
+    # Caching only `protoc -> ascend_protoc` would restore a broken link
+    # after deleting the transient build tree. Include the in-tree target
+    # closure even when the target does not match ARTIFACT_INCLUDE.
+    root = Path(os.path.abspath(root))
+    expanded = set(selected)
+    pending = list(selected)
+
+    while pending:
+        relative = pending.pop()
+        path = root / relative
+        if not path.is_symlink():
+            continue
+
+        target = _internal_symlink_target(root, path)
+        if target is None:
+            # External links belong to the environment. Preserve the link
+            # itself but do not import external files into this cache entry.
+            continue
+        if not (target.is_symlink() or target.is_file()):
+            raise RuntimeError(
+                f"symlink artifact target does not exist: {path} -> "
+                f"{os.readlink(path)}"
+            )
+
+        target_relative = target.relative_to(root).as_posix()
+        if target_relative not in expanded:
+            expanded.add(target_relative)
+            pending.append(target_relative)
+
+    return expanded
+
+
 def _collect_artifacts(
     root: Path,
-    before: dict[str, tuple[int, int, int]],
+    before: dict[str, tuple],
     include_patterns: Sequence[str],
 ) -> list[str]:
     if not root.exists():
@@ -488,7 +550,7 @@ def _collect_artifacts(
     if include_patterns:
         selected: set[str] = set()
         for path in root.rglob("*"):
-            if not path.is_file() or path.is_symlink():
+            if not (path.is_symlink() or path.is_file()):
                 continue
             relative = path.relative_to(root).as_posix()
             if any(
@@ -496,14 +558,15 @@ def _collect_artifacts(
                 for pattern in include_patterns
             ):
                 selected.add(relative)
-        return sorted(selected)
+        return sorted(_expand_internal_symlink_targets(root, selected))
 
     after = _snapshot(root)
-    return sorted(
+    selected = {
         relative
         for relative, signature in after.items()
         if before.get(relative) != signature
-    )
+    }
+    return sorted(_expand_internal_symlink_targets(root, selected))
 
 
 def _safe_component(value: str) -> str:
@@ -605,20 +668,54 @@ def _validate_entry(entry: Path, final_key: str) -> dict | None:
 
     for artifact in manifest.get("artifacts", []):
         path = artifact_root / artifact["path"]
-        if not path.is_file():
+        kind = artifact.get("kind", "file")
+
+        if kind == "symlink":
+            if not path.is_symlink():
+                return None
+            if os.readlink(path) != artifact.get("target"):
+                return None
+            continue
+
+        if kind != "file":
+            return None
+        if not path.is_file() or path.is_symlink():
             return None
         if _sha256_file(path) != artifact["sha256"]:
             return None
     return manifest
 
 
+def _remove_existing_artifact(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        raise RuntimeError(
+            f"cannot restore file artifact over non-file path: {path}"
+        )
+
+
 def _restore_entry(entry: Path, output_dir: Path, manifest: dict) -> None:
     artifact_root = entry / "artifacts"
+
+    # Restore real files first so relative symlinks become valid immediately
+    # when they are created in the second pass.
     for artifact in manifest["artifacts"]:
+        if artifact.get("kind", "file") != "file":
+            continue
         source = artifact_root / artifact["path"]
         destination = output_dir / artifact["path"]
         destination.parent.mkdir(parents=True, exist_ok=True)
+        _remove_existing_artifact(destination)
         shutil.copy2(source, destination)
+
+    for artifact in manifest["artifacts"]:
+        if artifact.get("kind") != "symlink":
+            continue
+        destination = output_dir / artifact["path"]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _remove_existing_artifact(destination)
+        destination.symlink_to(artifact["target"])
 
 
 def _save_entry(
@@ -638,14 +735,29 @@ def _save_entry(
         artifacts: list[dict] = []
         for relative in artifact_paths:
             source = output_dir / relative
-            if not source.is_file():
-                continue
             destination = artifact_root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
+
+            if source.is_symlink():
+                target = os.readlink(source)
+                destination.symlink_to(target)
+                artifacts.append(
+                    {
+                        "path": relative,
+                        "kind": "symlink",
+                        "target": target,
+                    }
+                )
+                continue
+
+            if not source.is_file():
+                continue
+
             shutil.copy2(source, destination)
             artifacts.append(
                 {
                     "path": relative,
+                    "kind": "file",
                     "sha256": _sha256_file(destination),
                 }
             )
@@ -664,7 +776,16 @@ def _save_entry(
 
         for artifact in artifacts:
             cached = artifact_root / artifact["path"]
-            if _sha256_file(cached) != artifact["sha256"]:
+            if artifact["kind"] == "symlink":
+                if not cached.is_symlink():
+                    raise RuntimeError(
+                        f"cached symlink disappeared: {artifact['path']}"
+                    )
+                if os.readlink(cached) != artifact["target"]:
+                    raise RuntimeError(
+                        f"cached symlink target changed: {artifact['path']}"
+                    )
+            elif _sha256_file(cached) != artifact["sha256"]:
                 raise RuntimeError(
                     f"artifact verification failed: {artifact['path']}"
                 )
