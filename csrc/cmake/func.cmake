@@ -652,8 +652,21 @@ function(add_bin_compile_target)
                 list(APPEND _CACHE_SET_ENV ASCEND_CUSTOM_OPP_PATH=${CUSTOM_DIR})
             endif()
 
+            # Compile every action into a private directory. Multiple
+            # op_index actions may run in parallel, but must never infer artifact
+            # ownership from changes in their shared OP_BIN_OUT_DIR.
+            set(_CACHE_ACTION_ROOT ${_OUT_DIR}/cache_actions/${op_file})
+            set(_CACHE_ACTION_STAGE_DIR
+                ${_CACHE_ACTION_ROOT}/stages/${op_type}-${op_index}
+            )
+            set(_CACHE_PUBLISH_STATE_DIR
+                ${_CACHE_ACTION_ROOT}/publish_state
+            )
+
             # recipe_hash: how is it compiled? The upstream generated
-            # op_type/op_file/op_index script remains authoritative.
+            # op_type/op_file/op_index script remains authoritative. The stage
+            # path is under CMAKE_BINARY_DIR and is normalized by the cache
+            # wrapper, so workspace location does not enter the semantic key.
             vllm_ascend_build_cache_command(
                 _BUILD_COMMAND
                 DOMAIN custom_operator
@@ -663,14 +676,16 @@ function(add_bin_compile_target)
                 ACTION ${op_type}-${op_index}
                 OPERATOR_SOURCE ${${op_file}_dir}
                 REPO_ROOT ${CMAKE_SOURCE_DIR}
-                OUTPUT_DIR ${OP_BIN_OUT_DIR}
+                OUTPUT_DIR ${_CACHE_ACTION_STAGE_DIR}
+                PUBLISH_DIR ${OP_BIN_OUT_DIR}
+                PUBLISH_STATE_DIR ${_CACHE_PUBLISH_STATE_DIR}
                 PREPARED_INPUT ${_CACHE_PREPARED_INPUTS}
                 RECIPE_FILE ${bin_script}
                 ENVIRONMENT_PROFILE ascendc
                 ENVIRONMENT_FILE ${_CACHE_ENVIRONMENT_FILES}
                 NORMALIZE_PATH ${ASCEND_CANN_PACKAGE_PATH}
                 SET_ENV ${_CACHE_SET_ENV}
-                COMMAND bash ${bin_script} ${OP_SRC_OUT_DIR}/${op_type}.py ${OP_BIN_OUT_DIR}
+                COMMAND bash ${bin_script} ${OP_SRC_OUT_DIR}/${op_type}.py ${_CACHE_ACTION_STAGE_DIR}
             )
 
             if(CMAKE_GENERATOR MATCHES "Unix Makefiles")

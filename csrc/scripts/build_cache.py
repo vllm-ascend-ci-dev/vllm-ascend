@@ -28,6 +28,8 @@ import time
 from typing import Iterable, Sequence
 
 SCHEMA_VERSION = 3
+ARTIFACT_MODEL_BY_DOMAIN = {"third_party": 1, "custom_operator": 2}
+PUBLISH_STATE_SCHEMA = 1
 CHUNK_SIZE = 1024 * 1024
 DEFAULT_EXCLUDES = (
     ".git",
@@ -654,7 +656,77 @@ def _file_lock(path: Path):
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def _validate_entry(entry: Path, final_key: str) -> dict | None:
+@contextlib.contextmanager
+def _file_lock_or_error(path: Path):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stream = path.open("a+")
+    except OSError as exc:
+        yield exc
+        return
+
+    with stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            yield exc
+            return
+        try:
+            yield None
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _expected_artifact_model(domain: str) -> int:
+    try:
+        return ARTIFACT_MODEL_BY_DOMAIN[domain]
+    except KeyError as exc:
+        raise ValueError(f"unknown cache domain: {domain}") from exc
+
+
+def _validate_artifact(root: Path, artifact: dict) -> bool:
+    path = root / artifact["path"]
+    kind = artifact.get("kind", "file")
+
+    if kind == "symlink":
+        return path.is_symlink() and os.readlink(path) == artifact.get("target")
+
+    if kind != "file":
+        return False
+    return (
+        path.is_file()
+        and not path.is_symlink()
+        and _sha256_file(path) == artifact.get("sha256")
+    )
+
+
+def _describe_artifacts(root: Path, artifact_paths: Sequence[str]) -> list[dict]:
+    artifacts: list[dict] = []
+    for relative in sorted(set(artifact_paths)):
+        source = root / relative
+        if source.is_symlink():
+            artifacts.append(
+                {
+                    "path": relative,
+                    "kind": "symlink",
+                    "target": os.readlink(source),
+                }
+            )
+            continue
+        if source.is_file():
+            artifacts.append(
+                {
+                    "path": relative,
+                    "kind": "file",
+                    "sha256": _sha256_file(source),
+                }
+            )
+    if not artifacts:
+        raise RuntimeError(f"no cacheable artifacts found in {root}")
+    return artifacts
+
+
+def _validate_entry(entry: Path, final_key: str, domain: str) -> dict | None:
     manifest_path = entry / "manifest.json"
     artifact_root = entry / "artifacts"
     if not manifest_path.is_file() or not artifact_root.is_dir():
@@ -665,63 +737,103 @@ def _validate_entry(entry: Path, final_key: str) -> dict | None:
         return None
     if manifest.get("final_key") != final_key:
         return None
+    if manifest.get("domain") != domain:
+        return None
 
-    for artifact in manifest.get("artifacts", []):
-        path = artifact_root / artifact["path"]
-        kind = artifact.get("kind", "file")
+    # Existing schema-3 third-party entries predate artifact_model and are
+    # still safe: their symlink-aware serialization is already complete.
+    # Existing schema-3 custom-operator entries are *not* safe because they
+    # were discovered by diffing a shared output directory under parallel
+    # compilation. Treat missing artifact_model as the legacy model (1), so
+    # only custom operators are invalidated by the new isolated model (2).
+    artifact_model = manifest.get("artifact_model", 1)
+    if artifact_model != _expected_artifact_model(domain):
+        return None
 
-        if kind == "symlink":
-            if not path.is_symlink():
-                return None
-            if os.readlink(path) != artifact.get("target"):
-                return None
-            continue
-
-        if kind != "file":
-            return None
-        if not path.is_file() or path.is_symlink():
-            return None
-        if _sha256_file(path) != artifact["sha256"]:
-            return None
+    artifacts = manifest.get("artifacts", [])
+    if not artifacts:
+        return None
+    try:
+        valid = all(
+            _validate_artifact(artifact_root, artifact)
+            for artifact in artifacts
+        )
+    except OSError:
+        return None
+    if not valid:
+        return None
     return manifest
 
 
-def _remove_existing_artifact(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-    elif path.exists():
-        raise RuntimeError(
-            f"cannot restore file artifact over non-file path: {path}"
-        )
+def _atomic_copy_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.build-cache-",
+        suffix=".tmp",
+        dir=str(destination.parent),
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        shutil.copy2(source, temp_path)
+        os.replace(temp_path, destination)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temp_path.unlink()
+
+
+def _atomic_create_symlink(target: str, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.build-cache-",
+        suffix=".tmp",
+        dir=str(destination.parent),
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    temp_path.unlink()
+    try:
+        temp_path.symlink_to(target)
+        os.replace(temp_path, destination)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temp_path.unlink()
+
+
+def _atomic_publish_artifact(
+    source_root: Path,
+    destination_root: Path,
+    artifact: dict,
+) -> None:
+    source = source_root / artifact["path"]
+    destination = destination_root / artifact["path"]
+    kind = artifact.get("kind", "file")
+
+    if kind == "file":
+        _atomic_copy_file(source, destination)
+        return
+    if kind == "symlink":
+        _atomic_create_symlink(artifact["target"], destination)
+        return
+    raise RuntimeError(f"unsupported artifact kind: {kind!r}")
 
 
 def _restore_entry(entry: Path, output_dir: Path, manifest: dict) -> None:
     artifact_root = entry / "artifacts"
 
-    # Restore real files first so relative symlinks become valid immediately
-    # when they are created in the second pass.
+    # Files first, then symlinks, so relative symlinks are valid immediately.
     for artifact in manifest["artifacts"]:
-        if artifact.get("kind", "file") != "file":
-            continue
-        source = artifact_root / artifact["path"]
-        destination = output_dir / artifact["path"]
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        _remove_existing_artifact(destination)
-        shutil.copy2(source, destination)
-
+        if artifact.get("kind", "file") == "file":
+            _atomic_publish_artifact(artifact_root, output_dir, artifact)
     for artifact in manifest["artifacts"]:
-        if artifact.get("kind") != "symlink":
-            continue
-        destination = output_dir / artifact["path"]
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        _remove_existing_artifact(destination)
-        destination.symlink_to(artifact["target"])
+        if artifact.get("kind") == "symlink":
+            _atomic_publish_artifact(artifact_root, output_dir, artifact)
 
 
 def _save_entry(
     entry: Path,
     output_dir: Path,
-    artifact_paths: Sequence[str],
+    artifacts: Sequence[dict],
     manifest_base: dict,
 ) -> None:
     entry.parent.mkdir(parents=True, exist_ok=True)
@@ -732,63 +844,26 @@ def _save_entry(
         artifact_root = temp_dir / "artifacts"
         artifact_root.mkdir(parents=True, exist_ok=True)
 
-        artifacts: list[dict] = []
-        for relative in artifact_paths:
-            source = output_dir / relative
-            destination = artifact_root / relative
+        serialized: list[dict] = []
+        for artifact in artifacts:
+            source = output_dir / artifact["path"]
+            destination = artifact_root / artifact["path"]
             destination.parent.mkdir(parents=True, exist_ok=True)
 
-            if source.is_symlink():
-                target = os.readlink(source)
-                destination.symlink_to(target)
-                artifacts.append(
-                    {
-                        "path": relative,
-                        "kind": "symlink",
-                        "target": target,
-                    }
-                )
-                continue
-
-            if not source.is_file():
-                continue
-
-            shutil.copy2(source, destination)
-            artifacts.append(
-                {
-                    "path": relative,
-                    "kind": "file",
-                    "sha256": _sha256_file(destination),
-                }
-            )
-
-        if not artifacts:
-            raise RuntimeError(
-                "build command succeeded but produced no cacheable artifacts "
-                f"in {output_dir}"
-            )
+            if artifact.get("kind", "file") == "symlink":
+                destination.symlink_to(artifact["target"])
+            else:
+                shutil.copy2(source, destination)
+            serialized.append(dict(artifact))
 
         manifest = dict(manifest_base)
         manifest["schema"] = SCHEMA_VERSION
-        manifest["artifacts"] = artifacts
+        manifest["artifacts"] = serialized
         manifest["created_at"] = int(time.time())
         _atomic_write_json(temp_dir / "manifest.json", manifest)
 
-        for artifact in artifacts:
-            cached = artifact_root / artifact["path"]
-            if artifact["kind"] == "symlink":
-                if not cached.is_symlink():
-                    raise RuntimeError(
-                        f"cached symlink disappeared: {artifact['path']}"
-                    )
-                if os.readlink(cached) != artifact["target"]:
-                    raise RuntimeError(
-                        f"cached symlink target changed: {artifact['path']}"
-                    )
-            elif _sha256_file(cached) != artifact["sha256"]:
-                raise RuntimeError(
-                    f"artifact verification failed: {artifact['path']}"
-                )
+        if not all(_validate_artifact(artifact_root, artifact) for artifact in serialized):
+            raise RuntimeError("artifact verification failed before cache publish")
 
         if entry.exists():
             shutil.rmtree(entry)
@@ -796,6 +871,162 @@ def _save_entry(
     finally:
         if temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _reset_private_output(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _publish_action_state_path(state_dir: Path, action_identity: str) -> Path:
+    digest = _sha256_bytes(action_identity.encode("utf-8"))
+    return state_dir / "actions" / f"{digest}.json"
+
+
+def _load_publish_state(path: Path, default: dict) -> dict:
+    payload = _load_json(path, default)
+    if payload.get("schema") != PUBLISH_STATE_SCHEMA:
+        return default
+    return payload
+
+
+def _publish_action_artifacts(
+    *,
+    source_root: Path,
+    publish_dir: Path,
+    publish_state_dir: Path,
+    action_identity: str,
+    artifacts: Sequence[dict],
+) -> None:
+    publish_dir.mkdir(parents=True, exist_ok=True)
+    publish_state_dir.mkdir(parents=True, exist_ok=True)
+
+    lock_path = publish_state_dir / ".publish.lock"
+    owners_path = publish_state_dir / "owners.json"
+    action_state_path = _publish_action_state_path(
+        publish_state_dir,
+        action_identity,
+    )
+
+    with _file_lock(lock_path):
+        owners = _load_publish_state(
+            owners_path,
+            {
+                "schema": PUBLISH_STATE_SCHEMA,
+                "initialized": False,
+                "owners": {},
+            },
+        )
+
+        # The first isolated-model publisher owns initialization of the shared
+        # operator output directory. This removes stale files left by the
+        # legacy shared-snapshot model without racing other actions: all real
+        # compilation now happens in private stage directories, and this short
+        # bootstrap is protected by the shared publish lock.
+        if not owners.get("initialized", False):
+            if publish_dir.exists():
+                shutil.rmtree(publish_dir)
+            publish_dir.mkdir(parents=True, exist_ok=True)
+            owners["initialized"] = True
+
+        action_state = _load_publish_state(
+            action_state_path,
+            {
+                "schema": PUBLISH_STATE_SCHEMA,
+                "action": action_identity,
+                "artifacts": [],
+            },
+        )
+
+        owner_map = owners.setdefault("owners", {})
+        previous = {
+            artifact["path"]: artifact
+            for artifact in action_state.get("artifacts", [])
+        }
+        current = {artifact["path"]: artifact for artifact in artifacts}
+
+        # Remove artifacts that this action published in an earlier invocation
+        # but no longer produces. The owner table lives in the disposable build
+        # tree, so it cannot affect another checkout/workspace.
+        for relative, old_artifact in previous.items():
+            if relative in current:
+                continue
+            owner = owner_map.get(relative)
+            if not owner or owner.get("action") != action_identity:
+                continue
+            destination = publish_dir / relative
+            if destination.is_symlink() or destination.is_file():
+                if not _validate_artifact(publish_dir, old_artifact):
+                    raise RuntimeError(
+                        "published artifact changed outside its owning action: "
+                        f"{destination}"
+                    )
+                destination.unlink(missing_ok=True)
+            elif destination.exists():
+                raise RuntimeError(
+                    f"published artifact became a directory: {destination}"
+                )
+            owner_map.pop(relative, None)
+
+        # Publish each action's exact private outputs into the shared directory.
+        # The publish lock serializes this short operation while compilation
+        # itself remains fully parallel in private stage directories.
+        ordered = sorted(
+            artifacts,
+            key=lambda item: (item.get("kind") == "symlink", item["path"]),
+        )
+        for artifact in ordered:
+            relative = artifact["path"]
+            owner = owner_map.get(relative)
+            if owner and owner.get("action") != action_identity:
+                raise RuntimeError(
+                    "custom-operator artifact ownership collision: "
+                    f"{relative} owned by {owner.get('action')}, "
+                    f"requested by {action_identity}"
+                )
+            _atomic_publish_artifact(source_root, publish_dir, artifact)
+            owner_map[relative] = {
+                "action": action_identity,
+                "artifact": dict(artifact),
+            }
+
+        owners["schema"] = PUBLISH_STATE_SCHEMA
+        action_state = {
+            "schema": PUBLISH_STATE_SCHEMA,
+            "action": action_identity,
+            "artifacts": [dict(item) for item in artifacts],
+        }
+        _atomic_write_json(owners_path, owners)
+        _atomic_write_json(action_state_path, action_state)
+
+
+def _safe_update_index(*args, **kwargs) -> None:
+    try:
+        _update_index(*args, **kwargs)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(
+            f"[build-cache] WARNING index update failed: {exc}",
+            flush=True,
+        )
+
+
+def _run_build_command(
+    args: argparse.Namespace,
+    command: Sequence[str],
+) -> tuple[int, float]:
+    environment = _parse_set_env(args.set_env)
+    start = time.monotonic()
+    process = subprocess.run(
+        list(command),
+        cwd=args.working_directory,
+        env=environment,
+        check=False,
+        close_fds=False,
+    )
+    return process.returncode, time.monotonic() - start
 
 
 def _logical_status(
@@ -899,14 +1130,27 @@ def run(args: argparse.Namespace) -> int:
     environment_files = [Path(value) for value in args.environment_file]
     normalize_paths = [Path(value) for value in args.normalize_path]
     output_dir = Path(args.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+
+    publish_dir: Path | None = None
+    publish_state_dir: Path | None = None
+    if args.domain == "custom_operator":
+        if not args.operator_source:
+            raise ValueError("custom_operator cache requires --operator-source")
+        if not args.publish_dir or not args.publish_state_dir:
+            raise ValueError(
+                "custom_operator cache requires --publish-dir and "
+                "--publish-state-dir for action-isolated output"
+            )
+        publish_dir = Path(args.publish_dir).resolve()
+        publish_state_dir = Path(args.publish_state_dir).resolve()
+    else:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     command = list(args.command)
     if not command:
         raise ValueError("missing build command after --")
 
     excludes = tuple(DEFAULT_EXCLUDES) + tuple(args.exclude)
-
     prepared_input_hash, prepared_manifest = _hash_prepared_inputs(
         prepared_inputs,
         excludes,
@@ -915,15 +1159,8 @@ def run(args: argparse.Namespace) -> int:
     operator_text_hash: str | None = None
     operator_text_manifest: list[dict] = []
     if args.domain == "custom_operator":
-        if not args.operator_source:
-            raise ValueError(
-                "custom_operator cache requires --operator-source"
-            )
         repo_root = Path(args.repo_root) if args.repo_root else None
-        (
-            operator_text_hash,
-            operator_text_manifest,
-        ) = _hash_operator_text(
+        operator_text_hash, operator_text_manifest = _hash_operator_text(
             Path(args.operator_source),
             repo_root,
         )
@@ -958,7 +1195,6 @@ def run(args: argparse.Namespace) -> int:
         operator=args.operator,
         action=args.action,
     )
-
     lock_name = _sha256_bytes(str(entry).encode("utf-8"))
     entry_lock = cache_root / args.domain / ".locks" / f"{lock_name}.lock"
 
@@ -969,6 +1205,7 @@ def run(args: argparse.Namespace) -> int:
         "operator": args.operator,
         "action": args.action,
         "final_key": final_key,
+        "artifact_model": _expected_artifact_model(args.domain),
         "operator_text_hash": operator_text_hash,
         "prepared_input_hash": prepared_input_hash,
         "recipe_hash": recipe_hash,
@@ -979,73 +1216,8 @@ def run(args: argparse.Namespace) -> int:
         "compiler_environment": environment_manifest,
     }
 
-    with _file_lock(entry_lock):
-        manifest = _validate_entry(entry, final_key)
-        if manifest is not None:
-            _restore_entry(entry, output_dir, manifest)
-            print(
-                f"[build-cache] HIT domain={args.domain} unit={args.unit} "
-                f"key={final_key}",
-                flush=True,
-            )
-            _update_index(
-                cache_root,
-                args.domain,
-                args.unit,
-                final_key,
-                prepared_input_hash,
-                recipe_hash,
-                environment_hash,
-                "HIT",
-                operator_text_hash,
-                args.soc,
-                args.operator,
-                args.action,
-            )
-            return 0
-
-        print(
-            f"[build-cache] MISS domain={args.domain} unit={args.unit} "
-            f"key={final_key}",
-            flush=True,
-        )
-
-        before = _snapshot(output_dir)
-        environment = _parse_set_env(args.set_env)
-        start = time.monotonic()
-        process = subprocess.run(
-            command,
-            cwd=args.working_directory,
-            env=environment,
-            check=False,
-            close_fds=False,
-        )
-        elapsed = time.monotonic() - start
-        if process.returncode != 0:
-            return process.returncode
-
-        artifacts = _collect_artifacts(
-            output_dir,
-            before,
-            args.artifact_include,
-        )
-        _save_entry(
-            entry,
-            output_dir,
-            artifacts,
-            {
-                **manifest_base,
-                "build_seconds": elapsed,
-            },
-        )
-        print(
-            f"[build-cache] SAVED domain={args.domain} unit={args.unit} "
-            f"key={final_key} artifacts={len(artifacts)} "
-            f"build_seconds={elapsed:.3f}",
-            flush=True,
-        )
-
-        _update_index(
+    def update_index(cache_status: str) -> None:
+        _safe_update_index(
             cache_root,
             args.domain,
             args.unit,
@@ -1053,13 +1225,161 @@ def run(args: argparse.Namespace) -> int:
             prepared_input_hash,
             recipe_hash,
             environment_hash,
-            "MISS_BUILT",
+            cache_status,
             operator_text_hash,
             args.soc,
             args.operator,
             args.action,
         )
+
+    def publish_custom(artifacts: Sequence[dict]) -> None:
+        assert publish_dir is not None
+        assert publish_state_dir is not None
+        action_identity = f"{args.unit}/{args.action}"
+        _publish_action_artifacts(
+            source_root=output_dir,
+            publish_dir=publish_dir,
+            publish_state_dir=publish_state_dir,
+            action_identity=action_identity,
+            artifacts=artifacts,
+        )
+
+    def build_without_cache(reason: str) -> int:
+        print(
+            f"[build-cache] BYPASS domain={args.domain} unit={args.unit} "
+            f"reason={reason}",
+            flush=True,
+        )
+        if args.domain == "custom_operator":
+            _reset_private_output(output_dir)
+            returncode, _ = _run_build_command(args, command)
+            if returncode != 0:
+                return returncode
+            paths = _collect_artifacts(output_dir, {}, args.artifact_include)
+            artifacts = _describe_artifacts(output_dir, paths)
+            publish_custom(artifacts)
+            return 0
+
+        before = _snapshot(output_dir)
+        returncode, _ = _run_build_command(args, command)
+        if returncode != 0:
+            return returncode
+        # No cache save in bypass mode; third-party products already live in
+        # output_dir and downstream can continue.
+        _collect_artifacts(output_dir, before, args.artifact_include)
         return 0
+
+    # Same action + same build tree must never reset the same private stage
+    # concurrently, even if the persistent cache itself is unavailable.
+    if args.domain == "custom_operator":
+        assert publish_state_dir is not None
+        action_identity = f"{args.unit}/{args.action}"
+        action_lock_name = _sha256_bytes(action_identity.encode("utf-8"))
+        action_lock = (
+            publish_state_dir
+            / ".action_locks"
+            / f"{action_lock_name}.lock"
+        )
+    else:
+        action_lock = None
+
+    @contextlib.contextmanager
+    def action_scope():
+        if action_lock is None:
+            yield
+        else:
+            with _file_lock(action_lock):
+                yield
+
+    with action_scope():
+        with _file_lock_or_error(entry_lock) as lock_error:
+            if lock_error is not None:
+                return build_without_cache(
+                    f"cache lock unavailable: {lock_error}"
+                )
+
+            manifest = _validate_entry(entry, final_key, args.domain)
+            if manifest is not None:
+                try:
+                    if args.domain == "custom_operator":
+                        _reset_private_output(output_dir)
+                    _restore_entry(entry, output_dir, manifest)
+                    if args.domain == "custom_operator":
+                        publish_custom(manifest["artifacts"])
+                    print(
+                        f"[build-cache] HIT domain={args.domain} "
+                        f"unit={args.unit} key={final_key}",
+                        flush=True,
+                    )
+                    update_index("HIT")
+                    return 0
+                except (OSError, RuntimeError) as exc:
+                    print(
+                        f"[build-cache] WARNING restore failed; rebuilding "
+                        f"domain={args.domain} unit={args.unit} "
+                        f"key={final_key}: {exc}",
+                        flush=True,
+                    )
+                    if args.domain == "custom_operator":
+                        _reset_private_output(output_dir)
+
+            print(
+                f"[build-cache] MISS domain={args.domain} unit={args.unit} "
+                f"key={final_key}",
+                flush=True,
+            )
+
+            if args.domain == "custom_operator":
+                _reset_private_output(output_dir)
+                before: dict[str, tuple] = {}
+            else:
+                before = _snapshot(output_dir)
+
+            returncode, elapsed = _run_build_command(args, command)
+            if returncode != 0:
+                return returncode
+
+            paths = _collect_artifacts(
+                output_dir,
+                before,
+                args.artifact_include,
+            )
+            artifacts = _describe_artifacts(output_dir, paths)
+
+            if args.domain == "custom_operator":
+                # Publishing is part of build correctness and therefore must
+                # succeed. Cache persistence remains an optimization.
+                publish_custom(artifacts)
+
+            cache_saved = False
+            try:
+                _save_entry(
+                    entry,
+                    output_dir,
+                    artifacts,
+                    {
+                        **manifest_base,
+                        "build_seconds": elapsed,
+                    },
+                )
+                cache_saved = True
+                print(
+                    f"[build-cache] SAVED domain={args.domain} "
+                    f"unit={args.unit} key={final_key} "
+                    f"artifacts={len(artifacts)} "
+                    f"build_seconds={elapsed:.3f}",
+                    flush=True,
+                )
+            except (OSError, RuntimeError) as exc:
+                print(
+                    f"[build-cache] WARNING save failed; build result kept "
+                    f"domain={args.domain} unit={args.unit} "
+                    f"key={final_key}: {exc}",
+                    flush=True,
+                )
+
+            update_index("MISS_BUILT" if cache_saved else "MISS_UNCACHED")
+            return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1082,6 +1402,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--operator-source")
     run_parser.add_argument("--repo-root")
     run_parser.add_argument("--output-dir", required=True)
+    run_parser.add_argument("--publish-dir")
+    run_parser.add_argument("--publish-state-dir")
     run_parser.add_argument("--prepared-input", action="append", default=[])
     run_parser.add_argument("--recipe-file", action="append", default=[])
     run_parser.add_argument("--recipe-value", action="append", default=[])

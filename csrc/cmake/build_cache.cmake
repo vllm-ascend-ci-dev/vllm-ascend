@@ -52,6 +52,8 @@ function(vllm_ascend_build_cache_command OUT_VAR)
         OPERATOR_SOURCE
         REPO_ROOT
         OUTPUT_DIR
+        PUBLISH_DIR
+        PUBLISH_STATE_DIR
         ENVIRONMENT_PROFILE
     )
     set(
@@ -87,11 +89,19 @@ function(vllm_ascend_build_cache_command OUT_VAR)
         message(FATAL_ERROR "vllm_ascend_build_cache_command requires COMMAND")
     endif()
 
-    if(CACHE_DOMAIN STREQUAL "custom_operator" AND NOT CACHE_OPERATOR_SOURCE)
-        message(
-            FATAL_ERROR
-            "custom_operator cache requires OPERATOR_SOURCE"
-        )
+    if(CACHE_DOMAIN STREQUAL "custom_operator")
+        if(NOT CACHE_OPERATOR_SOURCE)
+            message(
+                FATAL_ERROR
+                "custom_operator cache requires OPERATOR_SOURCE"
+            )
+        endif()
+        if(NOT CACHE_PUBLISH_DIR OR NOT CACHE_PUBLISH_STATE_DIR)
+            message(
+                FATAL_ERROR
+                "custom_operator cache requires PUBLISH_DIR and PUBLISH_STATE_DIR"
+            )
+        endif()
     endif()
 
     if(NOT EXISTS "${VLLM_ASCEND_BUILD_CACHE_SCRIPT}")
@@ -117,6 +127,14 @@ function(vllm_ascend_build_cache_command OUT_VAR)
         --environment-profile
         ${CACHE_ENVIRONMENT_PROFILE}
     )
+
+    if(CACHE_PUBLISH_DIR)
+        list(APPEND _cache_command --publish-dir ${CACHE_PUBLISH_DIR})
+    endif()
+
+    if(CACHE_PUBLISH_STATE_DIR)
+        list(APPEND _cache_command --publish-state-dir ${CACHE_PUBLISH_STATE_DIR})
+    endif()
 
     if(CACHE_SOC)
         list(APPEND _cache_command --soc ${CACHE_SOC})

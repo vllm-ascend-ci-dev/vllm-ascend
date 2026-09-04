@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -30,6 +31,7 @@ def _write_builder(tmp_path: Path) -> Path:
     builder.write_text(
         '''from pathlib import Path
 import sys
+import time
 
 output_dir = Path(sys.argv[1])
 counter = Path(sys.argv[2])
@@ -41,6 +43,9 @@ count += 1
 counter.write_text(str(count))
 
 output_dir.mkdir(parents=True, exist_ok=True)
+
+if mode == "sleep":
+    time.sleep(0.35)
 
 if mode == "symlink":
     target = output_dir / "ascend_protoc"
@@ -76,7 +81,21 @@ def _run_cache(
     artifact_includes: list[str] | None = None,
     builder_mode: str = "counted",
     artifact_name: str = "kernel.o",
+    action: str = "TestOperator-0",
+    stage_dir: Path | None = None,
+    publish_state_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    actual_output = output_dir
+    if domain == "custom_operator":
+        safe_action = re.sub(r"[^A-Za-z0-9_.-]", "_", action)
+        stage_dir = stage_dir or (
+            output_dir.parent / "private-stages" / safe_action
+        )
+        publish_state_dir = publish_state_dir or (
+            output_dir.parent / "publish-state"
+        )
+        actual_output = stage_dir
+
     command = [
         sys.executable,
         str(ENGINE),
@@ -88,7 +107,7 @@ def _run_cache(
         "--unit",
         "test_unit",
         "--output-dir",
-        str(output_dir),
+        str(actual_output),
         "--environment-profile",
         "ascendc" if domain == "custom_operator" else "host-cxx",
         "--environment-tool",
@@ -110,6 +129,8 @@ def _run_cache(
     if domain == "custom_operator":
         if operator_source is None:
             operator_source = prepared_inputs[0]
+        assert stage_dir is not None
+        assert publish_state_dir is not None
         command.extend(
             [
                 "--soc",
@@ -117,9 +138,13 @@ def _run_cache(
                 "--operator",
                 "test_operator",
                 "--action",
-                "TestOperator-0",
+                action,
                 "--operator-source",
                 str(operator_source),
+                "--publish-dir",
+                str(output_dir),
+                "--publish-state-dir",
+                str(publish_state_dir),
             ]
         )
 
@@ -128,7 +153,7 @@ def _run_cache(
             "--",
             sys.executable,
             str(builder),
-            str(output_dir),
+            str(actual_output),
             str(counter),
             builder_mode,
             artifact_name,
@@ -142,7 +167,6 @@ def _run_cache(
         text=True,
         check=False,
     )
-
 
 def _assert_success(proc: subprocess.CompletedProcess[str]) -> None:
     assert proc.returncode == 0, (
@@ -670,3 +694,449 @@ def test_corrupted_cached_symlink_rebuilds(tmp_path: Path):
     assert "[build-cache] SAVED" in second.stdout
     assert _extract_key(second) == key
     assert counter.read_text() == "2"
+
+
+def _spawn_cache(**kwargs) -> subprocess.Popen[str]:
+    # Build the exact command through a lightweight recorder by duplicating the
+    # helper's argument assembly. The returned process lets tests overlap two
+    # real cache-engine invocations.
+    cache_root = kwargs["cache_root"]
+    prepared_inputs = kwargs["prepared_inputs"]
+    output_dir = kwargs["output_dir"]
+    builder = kwargs["builder"]
+    counter = kwargs["counter"]
+    operator_source = kwargs.get("operator_source") or prepared_inputs[0]
+    action = kwargs.get("action", "TestOperator-0")
+    artifact_name = kwargs.get("artifact_name", "kernel.o")
+    builder_mode = kwargs.get("builder_mode", "sleep")
+    recipe_values = kwargs.get("recipe_values") or ["recipe=stable"]
+    publish_state_dir = kwargs.get("publish_state_dir") or (
+        output_dir.parent / "publish-state"
+    )
+    safe_action = re.sub(r"[^A-Za-z0-9_.-]", "_", action)
+    stage_dir = kwargs.get("stage_dir") or (
+        output_dir.parent / "private-stages" / safe_action
+    )
+
+    command = [
+        sys.executable,
+        str(ENGINE),
+        "run",
+        "--cache-root",
+        str(cache_root),
+        "--domain",
+        "custom_operator",
+        "--unit",
+        "test_unit",
+        "--output-dir",
+        str(stage_dir),
+        "--publish-dir",
+        str(output_dir),
+        "--publish-state-dir",
+        str(publish_state_dir),
+        "--prepared-input",
+        str(prepared_inputs[0]),
+        "--recipe-value",
+        recipe_values[0],
+        "--environment-value",
+        "abi=test",
+        "--environment-profile",
+        "ascendc",
+        "--environment-tool",
+        sys.executable,
+        "--soc",
+        "ascend910b",
+        "--operator",
+        "test_operator",
+        "--action",
+        action,
+        "--operator-source",
+        str(operator_source),
+        "--",
+        sys.executable,
+        str(builder),
+        str(stage_dir),
+        str(counter),
+        builder_mode,
+        artifact_name,
+    ]
+    return subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _finish_process(proc: subprocess.Popen[str]) -> tuple[str, str]:
+    stdout, stderr = proc.communicate(timeout=10)
+    assert proc.returncode == 0, (
+        f"returncode={proc.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    )
+    return stdout, stderr
+
+
+def test_parallel_actions_have_exact_artifact_ownership(tmp_path: Path):
+    source, prepared = _make_operator_inputs(tmp_path)
+    output = tmp_path / "shared-output"
+    output.mkdir()
+    state = tmp_path / "publish-state"
+    cache_root = tmp_path / "cache"
+    builder = _write_builder(tmp_path)
+
+    first = _spawn_cache(
+        cache_root=cache_root,
+        prepared_inputs=[prepared],
+        operator_source=source,
+        output_dir=output,
+        publish_state_dir=state,
+        builder=builder,
+        counter=tmp_path / "counter-a",
+        action="TestOperator-0",
+        artifact_name="A.o",
+        recipe_values=["recipe=A"],
+    )
+    second = _spawn_cache(
+        cache_root=cache_root,
+        prepared_inputs=[prepared],
+        operator_source=source,
+        output_dir=output,
+        publish_state_dir=state,
+        builder=builder,
+        counter=tmp_path / "counter-b",
+        action="TestOperator-1",
+        artifact_name="B.o",
+        recipe_values=["recipe=B"],
+    )
+    out_a, _ = _finish_process(first)
+    out_b, _ = _finish_process(second)
+    assert "[build-cache] SAVED" in out_a
+    assert "[build-cache] SAVED" in out_b
+    assert (output / "A.o").is_file()
+    assert (output / "B.o").is_file()
+
+    manifests = []
+    for manifest_path in (cache_root / "custom_operator").rglob("manifest.json"):
+        manifests.append(json.loads(manifest_path.read_text(encoding="utf-8")))
+    assert len(manifests) == 2
+    by_action = {manifest["action"]: manifest for manifest in manifests}
+    assert {item["path"] for item in by_action["TestOperator-0"]["artifacts"]} == {"A.o"}
+    assert {item["path"] for item in by_action["TestOperator-1"]["artifacts"]} == {"B.o"}
+    assert all(manifest["artifact_model"] == 2 for manifest in manifests)
+
+
+def test_parallel_cache_hits_publish_without_shared_output_race(tmp_path: Path):
+    source, prepared = _make_operator_inputs(tmp_path)
+    output = tmp_path / "shared-output"
+    output.mkdir()
+    state = tmp_path / "publish-state"
+    cache_root = tmp_path / "cache"
+    builder = _write_builder(tmp_path)
+
+    for action, artifact, recipe, counter_name in [
+        ("TestOperator-0", "A.o", "recipe=A", "counter-a"),
+        ("TestOperator-1", "B.o", "recipe=B", "counter-b"),
+    ]:
+        proc = _run_cache(
+            cache_root=cache_root,
+            prepared_inputs=[prepared],
+            operator_source=source,
+            output_dir=output,
+            publish_state_dir=state,
+            builder=builder,
+            counter=tmp_path / counter_name,
+            action=action,
+            artifact_name=artifact,
+            recipe_values=[recipe],
+        )
+        _assert_success(proc)
+
+    _fresh_dir(output)
+    shutil.rmtree(tmp_path / "private-stages", ignore_errors=True)
+
+    first = _spawn_cache(
+        cache_root=cache_root,
+        prepared_inputs=[prepared],
+        operator_source=source,
+        output_dir=output,
+        publish_state_dir=state,
+        builder=builder,
+        counter=tmp_path / "counter-a",
+        action="TestOperator-0",
+        artifact_name="A.o",
+        recipe_values=["recipe=A"],
+        builder_mode="counted",
+    )
+    second = _spawn_cache(
+        cache_root=cache_root,
+        prepared_inputs=[prepared],
+        operator_source=source,
+        output_dir=output,
+        publish_state_dir=state,
+        builder=builder,
+        counter=tmp_path / "counter-b",
+        action="TestOperator-1",
+        artifact_name="B.o",
+        recipe_values=["recipe=B"],
+        builder_mode="counted",
+    )
+    out_a, _ = _finish_process(first)
+    out_b, _ = _finish_process(second)
+    assert "[build-cache] HIT" in out_a
+    assert "[build-cache] HIT" in out_b
+    assert (output / "A.o").is_file()
+    assert (output / "B.o").is_file()
+    assert (tmp_path / "counter-a").read_text() == "1"
+    assert (tmp_path / "counter-b").read_text() == "1"
+
+
+def test_same_key_parallel_requests_compile_once(tmp_path: Path):
+    source, prepared = _make_operator_inputs(tmp_path)
+    output = tmp_path / "shared-output"
+    output.mkdir()
+    state = tmp_path / "publish-state"
+    cache_root = tmp_path / "cache"
+    builder = _write_builder(tmp_path)
+    counter = tmp_path / "counter"
+
+    first = _spawn_cache(
+        cache_root=cache_root,
+        prepared_inputs=[prepared],
+        operator_source=source,
+        output_dir=output,
+        publish_state_dir=state,
+        builder=builder,
+        counter=counter,
+        action="TestOperator-0",
+        artifact_name="A.o",
+        recipe_values=["recipe=A"],
+    )
+    time.sleep(0.05)
+    second = _spawn_cache(
+        cache_root=cache_root,
+        prepared_inputs=[prepared],
+        operator_source=source,
+        output_dir=output,
+        publish_state_dir=state,
+        builder=builder,
+        counter=counter,
+        action="TestOperator-0",
+        artifact_name="A.o",
+        recipe_values=["recipe=A"],
+    )
+    out_a, _ = _finish_process(first)
+    out_b, _ = _finish_process(second)
+    combined = out_a + out_b
+    assert combined.count("[build-cache] MISS") == 1
+    assert combined.count("[build-cache] HIT") == 1
+    assert counter.read_text() == "1"
+
+
+def test_same_action_removes_stale_published_artifact(tmp_path: Path):
+    source, prepared = _make_operator_inputs(tmp_path)
+    output = tmp_path / "shared-output"
+    output.mkdir()
+    state = tmp_path / "publish-state"
+    cache_root = tmp_path / "cache"
+    builder = _write_builder(tmp_path)
+    counter = tmp_path / "counter"
+
+    first = _run_cache(
+        cache_root=cache_root,
+        prepared_inputs=[prepared],
+        operator_source=source,
+        output_dir=output,
+        publish_state_dir=state,
+        builder=builder,
+        counter=counter,
+        action="TestOperator-0",
+        artifact_name="old.o",
+        recipe_values=["recipe=old"],
+    )
+    _assert_success(first)
+    assert (output / "old.o").is_file()
+
+    second = _run_cache(
+        cache_root=cache_root,
+        prepared_inputs=[prepared],
+        operator_source=source,
+        output_dir=output,
+        publish_state_dir=state,
+        builder=builder,
+        counter=counter,
+        action="TestOperator-0",
+        artifact_name="new.o",
+        recipe_values=["recipe=new"],
+    )
+    _assert_success(second)
+    assert not (output / "old.o").exists()
+    assert (output / "new.o").is_file()
+
+
+def test_legacy_custom_operator_model_is_rebuilt(tmp_path: Path):
+    source, prepared = _make_operator_inputs(tmp_path)
+    output = tmp_path / "output"
+    output.mkdir()
+    cache_root = tmp_path / "cache"
+    counter = tmp_path / "counter"
+    builder = _write_builder(tmp_path)
+
+    first = _run_cache(
+        cache_root=cache_root,
+        prepared_inputs=[prepared],
+        operator_source=source,
+        output_dir=output,
+        builder=builder,
+        counter=counter,
+    )
+    _assert_success(first)
+    key = _extract_key(first)
+    entry = _only_entry(cache_root, "custom_operator", key)
+    manifest_path = entry / "manifest.json"
+    manifest = _manifest(entry)
+    manifest.pop("artifact_model")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    _fresh_dir(output)
+    second = _run_cache(
+        cache_root=cache_root,
+        prepared_inputs=[prepared],
+        operator_source=source,
+        output_dir=output,
+        builder=builder,
+        counter=counter,
+    )
+    _assert_success(second)
+    assert "[build-cache] MISS" in second.stdout
+    assert counter.read_text() == "2"
+
+
+def test_schema3_third_party_without_artifact_model_still_hits(tmp_path: Path):
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    (prepared / "third_party.cc").write_text("source\n", encoding="utf-8")
+    output = tmp_path / "output"
+    output.mkdir()
+    cache_root = tmp_path / "cache"
+    counter = tmp_path / "counter"
+    builder = _write_builder(tmp_path)
+
+    first = _run_cache(
+        cache_root=cache_root,
+        prepared_inputs=[prepared],
+        output_dir=output,
+        builder=builder,
+        counter=counter,
+        domain="third_party",
+        artifact_includes=["*.a"],
+        artifact_name="libtest.a",
+    )
+    _assert_success(first)
+    key = _extract_key(first)
+    entry = _only_entry(cache_root, "third_party", key)
+    manifest_path = entry / "manifest.json"
+    manifest = _manifest(entry)
+    manifest.pop("artifact_model")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    _fresh_dir(output)
+    second = _run_cache(
+        cache_root=cache_root,
+        prepared_inputs=[prepared],
+        output_dir=output,
+        builder=builder,
+        counter=counter,
+        domain="third_party",
+        artifact_includes=["*.a"],
+        artifact_name="libtest.a",
+    )
+    _assert_success(second)
+    assert "[build-cache] HIT" in second.stdout
+    assert counter.read_text() == "1"
+
+
+
+def test_cache_lock_failure_is_fail_open_for_custom_operator(tmp_path: Path):
+    source, prepared = _make_operator_inputs(tmp_path)
+    output = tmp_path / "output"
+    output.mkdir()
+    builder = _write_builder(tmp_path)
+    counter = tmp_path / "counter"
+
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("block cache mkdir", encoding="utf-8")
+    unusable_cache = blocker / "cache"
+
+    proc = _run_cache(
+        cache_root=unusable_cache,
+        prepared_inputs=[prepared],
+        operator_source=source,
+        output_dir=output,
+        builder=builder,
+        counter=counter,
+    )
+    _assert_success(proc)
+    assert "[build-cache] BYPASS" in proc.stdout
+    assert (output / "kernel.o").is_file()
+    assert counter.read_text() == "1"
+
+
+def test_different_actions_cannot_publish_same_relative_path(tmp_path: Path):
+    source, prepared = _make_operator_inputs(tmp_path)
+    output = tmp_path / "shared-output"
+    output.mkdir()
+    state = tmp_path / "publish-state"
+    cache_root = tmp_path / "cache"
+    builder = _write_builder(tmp_path)
+
+    first = _run_cache(
+        cache_root=cache_root,
+        prepared_inputs=[prepared],
+        operator_source=source,
+        output_dir=output,
+        publish_state_dir=state,
+        builder=builder,
+        counter=tmp_path / "counter-a",
+        action="TestOperator-0",
+        artifact_name="same.o",
+        recipe_values=["recipe=A"],
+    )
+    _assert_success(first)
+
+    second = _run_cache(
+        cache_root=cache_root,
+        prepared_inputs=[prepared],
+        operator_source=source,
+        output_dir=output,
+        publish_state_dir=state,
+        builder=builder,
+        counter=tmp_path / "counter-b",
+        action="TestOperator-1",
+        artifact_name="same.o",
+        recipe_values=["recipe=B"],
+    )
+    assert second.returncode != 0
+    assert "artifact ownership collision" in second.stderr
+
+
+def test_first_isolated_publish_cleans_legacy_shared_output(tmp_path: Path):
+    source, prepared = _make_operator_inputs(tmp_path)
+    output = tmp_path / "shared-output"
+    output.mkdir()
+    (output / "legacy-stale.o").write_text("stale", encoding="utf-8")
+    cache_root = tmp_path / "cache"
+    builder = _write_builder(tmp_path)
+
+    proc = _run_cache(
+        cache_root=cache_root,
+        prepared_inputs=[prepared],
+        operator_source=source,
+        output_dir=output,
+        publish_state_dir=tmp_path / "publish-state",
+        builder=builder,
+        counter=tmp_path / "counter",
+        artifact_name="current.o",
+    )
+    _assert_success(proc)
+    assert not (output / "legacy-stale.o").exists()
+    assert (output / "current.o").is_file()
