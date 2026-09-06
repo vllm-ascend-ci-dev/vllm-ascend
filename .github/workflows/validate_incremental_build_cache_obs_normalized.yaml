@@ -1,0 +1,376 @@
+name: Validate incremental build cache on OBS
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Source ref containing the incremental build-cache implementation
+        required: true
+        default: feat/local-incremental-build-cache
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash -el {0}
+
+concurrency:
+  group: incremental-build-cache-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Huawei OBS backend.
+  RUNS_ON_S3_BUCKET_CACHE: obs-guiiyang1-ascend-test
+  RUNS_ON_S3_BUCKET_ENDPOINT: https://obs.cn-southwest-2.myhuaweicloud.com
+  RUNS_ON_S3_FORCE_PATH_STYLE: "false"
+  AWS_S3_FORCE_PATH_STYLE: "false"
+  AWS_REGION: cn-southwest-2
+
+  # First validation target: A2 ARM64 Ubuntu.
+  SOC_VERSION: ascend910b1
+  MAX_JOBS: "16"
+
+  # Explicit local directory that is transported through OBS.
+  BUILD_CACHE_DIR: /tmp/vllm-ascend-incremental-build-cache
+
+jobs:
+  obs-smoke-write:
+    name: OBS smoke test - write
+    runs-on: linux-arm64-cpu-16
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
+    outputs:
+      smoke_key: ${{ steps.key.outputs.smoke_key }}
+
+    steps:
+      - name: Prepare smoke payload
+        id: key
+        run: |
+          set -euo pipefail
+          smoke_key="vllm-ascend-inc-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "smoke_key=${smoke_key}" >> "$GITHUB_OUTPUT"
+
+          rm -rf /tmp/vllm-ascend-obs-smoke
+          mkdir -p /tmp/vllm-ascend-obs-smoke
+          printf '%s\n' \
+            "run_id=${GITHUB_RUN_ID}" \
+            "run_attempt=${GITHUB_RUN_ATTEMPT}" \
+            "created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > /tmp/vllm-ascend-obs-smoke/payload.txt
+
+      - name: Save smoke payload to OBS
+        uses: runs-on/cache/save@v5
+        env:
+          RUNS_ON_RUNNER_NAME: ""
+          AWS_ACCESS_KEY_ID: ${{ secrets.OBS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_KEY }}
+        with:
+          path: /tmp/vllm-ascend-obs-smoke
+          key: ${{ steps.key.outputs.smoke_key }}
+
+  obs-smoke-read:
+    name: OBS smoke test - read only
+    needs: obs-smoke-write
+    runs-on: linux-arm64-cpu-16
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
+
+    steps:
+      - name: Restore smoke payload from OBS
+        id: restore
+        uses: runs-on/cache/restore@v5
+        with:
+          path: /tmp/vllm-ascend-obs-smoke
+          key: ${{ needs.obs-smoke-write.outputs.smoke_key }}
+
+      - name: Verify read-only restore
+        run: |
+          set -euo pipefail
+
+          echo "cache-hit=${{ steps.restore.outputs.cache-hit }}"
+          if [ "${{ steps.restore.outputs.cache-hit }}" != "true" ]; then
+            echo "::error::OBS smoke cache was not restored by exact key."
+            exit 1
+          fi
+
+          test -s /tmp/vllm-ascend-obs-smoke/payload.txt
+          cat /tmp/vllm-ascend-obs-smoke/payload.txt
+
+          {
+            echo "## OBS smoke test"
+            echo "- write with repository Secret: **PASS**"
+            echo "- fresh-runner read with built-in read-only credentials: **PASS**"
+            echo "- key: \`${{ needs.obs-smoke-write.outputs.smoke_key }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  seed-cache:
+    name: Seed incremental build cache into OBS
+    needs: obs-smoke-read
+    timeout-minutes: 90
+    runs-on: linux-arm64-cpu-16
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
+
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      cache_key: ${{ steps.cache-key.outputs.cache_key }}
+      op_saved: ${{ steps.seed-stats.outputs.op_saved }}
+      tp_saved: ${{ steps.seed-stats.outputs.tp_saved }}
+
+    steps:
+      - name: Checkout feature source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Resolve immutable source SHA
+        id: source
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build validation cache key
+        id: cache-key
+        run: |
+          set -euo pipefail
+          cache_key="vllm-ascend-inc-validation-a2-arm64-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "cache_key=${cache_key}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare build environment
+        run: |
+          set -euo pipefail
+
+          sed -Ei 's@(ports|archive).ubuntu.com@cache-service.nginx-pypi-cache.svc.cluster.local:8081@g' /etc/apt/sources.list
+          pip config set global.index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+          pip config set global.trusted-host cache-service.nginx-pypi-cache.svc.cluster.local
+
+          apt-get update -y
+          xargs apt-get -y install < packages.txt
+          apt-get -y install git zstd gcc g++ cmake libnuma-dev clang-15
+
+          update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20
+          update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20
+
+          pip install uv
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install build dependencies
+        env:
+          UV_INDEX_URL: http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+          UV_EXTRA_INDEX_URL: "https://repo.huaweicloud.com/ascend/repos/pypi http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          UV_INDEX_STRATEGY: unsafe-best-match
+          UV_INSECURE_HOST: cache-service.nginx-pypi-cache.svc.cluster.local
+          UV_HTTP_TIMEOUT: "120"
+          UV_NO_CACHE: "1"
+          UV_SYSTEM_PYTHON: "1"
+        run: |
+          set -euo pipefail
+
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          source /usr/local/Ascend/nnal/atb/set_env.sh
+
+          arch=$(uname -i)
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/Ascend/ascend-toolkit/latest/${arch}-linux/devlib"
+
+          pip install uc-manager
+          uv pip install -r requirements-dev.txt
+          uv pip install --force-reinstall --no-deps triton-ascend==3.2.2
+
+      - name: Cold build and populate incremental cache
+        id: seed-stats
+        env:
+          VLLM_ASCEND_BUILD_CACHE_DIR: ${{ env.BUILD_CACHE_DIR }}
+        run: |
+          set -euo pipefail
+
+          rm -rf "$BUILD_CACHE_DIR" csrc/build build
+          mkdir -p "$BUILD_CACHE_DIR"
+
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          source /usr/local/Ascend/nnal/atb/set_env.sh
+
+          start=$(date +%s)
+          uv pip install -e . 2>&1 | tee /tmp/seed-build.log
+          end=$(date +%s)
+
+          op_miss=$(grep -c '\[build-cache\] MISS domain=custom_operator' /tmp/seed-build.log || true)
+          op_saved=$(grep -c '\[build-cache\] SAVED domain=custom_operator' /tmp/seed-build.log || true)
+          tp_miss=$(grep -c '\[build-cache\] MISS domain=third_party' /tmp/seed-build.log || true)
+          tp_saved=$(grep -c '\[build-cache\] SAVED domain=third_party' /tmp/seed-build.log || true)
+
+          echo "op_saved=${op_saved}" >> "$GITHUB_OUTPUT"
+          echo "tp_saved=${tp_saved}" >> "$GITHUB_OUTPUT"
+
+          echo "cold_seconds=$((end-start))"
+          echo "operator MISS=${op_miss} SAVED=${op_saved}"
+          echo "third_party MISS=${tp_miss} SAVED=${tp_saved}"
+
+          test -d "$BUILD_CACHE_DIR"
+          du -sh "$BUILD_CACHE_DIR"
+          find "$BUILD_CACHE_DIR" -type f | wc -l
+
+          if [ "$op_miss" -le 0 ] || [ "$op_saved" -le 0 ]; then
+            echo "::error::Cold build did not populate custom-operator cache."
+            exit 1
+          fi
+
+          {
+            echo "## Incremental cache seed"
+            echo "- source: \`${{ steps.source.outputs.source_sha }}\`"
+            echo "- operator: MISS=${op_miss}, SAVED=${op_saved}"
+            echo "- third-party: MISS=${tp_miss}, SAVED=${tp_saved}"
+            echo "- cold build: $((end-start))s"
+            echo "- cache size: $(du -sh "$BUILD_CACHE_DIR" | awk '{print $1}')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save incremental build cache to OBS
+        uses: runs-on/cache/save@v5
+        env:
+          RUNS_ON_RUNNER_NAME: ""
+          AWS_ACCESS_KEY_ID: ${{ secrets.OBS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_KEY }}
+        with:
+          path: ${{ env.BUILD_CACHE_DIR }}
+          key: ${{ steps.cache-key.outputs.cache_key }}
+
+  reuse-cache:
+    name: Restore OBS cache on fresh runner
+    needs: seed-cache
+    timeout-minutes: 60
+    runs-on: linux-arm64-cpu-16
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
+
+    steps:
+      - name: Checkout exact source used by seed job
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.seed-cache.outputs.source_sha }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Prepare build environment
+        run: |
+          set -euo pipefail
+
+          sed -Ei 's@(ports|archive).ubuntu.com@cache-service.nginx-pypi-cache.svc.cluster.local:8081@g' /etc/apt/sources.list
+          pip config set global.index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+          pip config set global.trusted-host cache-service.nginx-pypi-cache.svc.cluster.local
+
+          apt-get update -y
+          xargs apt-get -y install < packages.txt
+          apt-get -y install git zstd gcc g++ cmake libnuma-dev clang-15
+
+          update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20
+          update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20
+
+          pip install uv
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install build dependencies
+        env:
+          UV_INDEX_URL: http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+          UV_EXTRA_INDEX_URL: "https://repo.huaweicloud.com/ascend/repos/pypi http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          UV_INDEX_STRATEGY: unsafe-best-match
+          UV_INSECURE_HOST: cache-service.nginx-pypi-cache.svc.cluster.local
+          UV_HTTP_TIMEOUT: "120"
+          UV_NO_CACHE: "1"
+          UV_SYSTEM_PYTHON: "1"
+        run: |
+          set -euo pipefail
+
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          source /usr/local/Ascend/nnal/atb/set_env.sh
+
+          arch=$(uname -i)
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/Ascend/ascend-toolkit/latest/${arch}-linux/devlib"
+
+          pip install uc-manager
+          uv pip install -r requirements-dev.txt
+          uv pip install --force-reinstall --no-deps triton-ascend==3.2.2
+
+      - name: Restore incremental build cache from OBS
+        id: restore
+        uses: runs-on/cache/restore@v5
+        with:
+          path: ${{ env.BUILD_CACHE_DIR }}
+          key: ${{ needs.seed-cache.outputs.cache_key }}
+
+      - name: Verify exact OBS restore
+        run: |
+          set -euo pipefail
+
+          echo "cache-hit=${{ steps.restore.outputs.cache-hit }}"
+          if [ "${{ steps.restore.outputs.cache-hit }}" != "true" ]; then
+            echo "::error::OBS cache was not restored with the exact validation key."
+            exit 1
+          fi
+
+          test -d "$BUILD_CACHE_DIR"
+          du -sh "$BUILD_CACHE_DIR"
+          find "$BUILD_CACHE_DIR" -type f | wc -l
+
+      - name: Fresh-tree pip install using restored incremental cache
+        env:
+          VLLM_ASCEND_BUILD_CACHE_DIR: ${{ env.BUILD_CACHE_DIR }}
+        run: |
+          set -euo pipefail
+
+          rm -rf csrc/build build
+
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          source /usr/local/Ascend/nnal/atb/set_env.sh
+
+          start=$(date +%s)
+          uv pip install -e . 2>&1 | tee /tmp/reuse-build.log
+          end=$(date +%s)
+
+          op_hit=$(grep -c '\[build-cache\] HIT domain=custom_operator' /tmp/reuse-build.log || true)
+          op_miss=$(grep -c '\[build-cache\] MISS domain=custom_operator' /tmp/reuse-build.log || true)
+          tp_hit=$(grep -c '\[build-cache\] HIT domain=third_party' /tmp/reuse-build.log || true)
+          tp_miss=$(grep -c '\[build-cache\] MISS domain=third_party' /tmp/reuse-build.log || true)
+
+          echo "cached_seconds=$((end-start))"
+          echo "operator HIT=${op_hit} MISS=${op_miss}"
+          echo "third_party HIT=${tp_hit} MISS=${tp_miss}"
+
+          expected_op="${{ needs.seed-cache.outputs.op_saved }}"
+          if [ "$op_hit" -le 0 ] || [ "$op_miss" -ne 0 ]; then
+            echo "::error::Custom-operator cache did not fully reuse on the fresh runner."
+            exit 1
+          fi
+          if [ -n "$expected_op" ] && [ "$expected_op" -gt 0 ] && [ "$op_hit" -ne "$expected_op" ]; then
+            echo "::error::Expected ${expected_op} operator HITs, observed ${op_hit}."
+            exit 1
+          fi
+
+          expected_tp="${{ needs.seed-cache.outputs.tp_saved }}"
+          if [ "$tp_miss" -ne 0 ]; then
+            echo "::error::Unexpected third-party MISS count: ${tp_miss}"
+            exit 1
+          fi
+          if [ -n "$expected_tp" ] && [ "$expected_tp" -gt 0 ] && [ "$tp_hit" -le 0 ]; then
+            echo "::error::Seed job cached third-party artifacts, but fresh runner did not HIT them."
+            exit 1
+          fi
+
+          if grep -Eq 'protoc: (No such file or directory|not found)|FileNotFoundError:|artifact ownership collision' /tmp/reuse-build.log; then
+            echo "::error::Known build-cache correctness failure detected."
+            exit 1
+          fi
+
+          test -d vllm_ascend/_cann_ops_custom
+          find vllm_ascend -maxdepth 1 -name '*.so' -type f | grep -q .
+
+          {
+            echo "## Incremental cache fresh-runner reuse"
+            echo "- OBS key: \`${{ needs.seed-cache.outputs.cache_key }}\`"
+            echo "- OBS exact restore: **${{ steps.restore.outputs.cache-hit }}**"
+            echo "- custom operator: HIT=${op_hit}, MISS=${op_miss}"
+            echo "- third-party: HIT=${tp_hit}, MISS=${tp_miss}"
+            echo "- cached fresh-tree build: $((end-start))s"
+          } >> "$GITHUB_STEP_SUMMARY"
