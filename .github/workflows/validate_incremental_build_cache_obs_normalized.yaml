@@ -31,6 +31,7 @@ env:
   UV_SYSTEM_PYTHON: "1"
 
   SOC_VERSION: ascend910b1
+  COMPILE_CUSTOM_KERNELS: "1"
   MAX_JOBS: "16"
   BUILD_CACHE_DIR: /tmp/vllm-ascend-incremental-build-cache
 
@@ -118,37 +119,37 @@ jobs:
           set -u
 
           start=$(date +%s)
-          uv pip install -e . 2>&1 | tee /tmp/seed-build.log
+          uv pip install -v -e . 2>&1 | tee /tmp/seed-build.log
           end=$(date +%s)
 
-          op_miss=$(grep -c '\[build-cache\] MISS domain=custom_operator' /tmp/seed-build.log || true)
-          op_saved=$(grep -c '\[build-cache\] SAVED domain=custom_operator' /tmp/seed-build.log || true)
-          tp_miss=$(grep -c '\[build-cache\] MISS domain=third_party' /tmp/seed-build.log || true)
-          tp_saved=$(grep -c '\[build-cache\] SAVED domain=third_party' /tmp/seed-build.log || true)
+          # Treat the cache contents as the source of truth. uv may suppress
+          # successful build-backend stdout unless verbose output is enabled.
+          op_entries=$(find "$BUILD_CACHE_DIR/custom_operator" -type f -name manifest.json 2>/dev/null | wc -l | tr -d ' ')
+          tp_entries=$(find "$BUILD_CACHE_DIR/third_party" -type f -name manifest.json 2>/dev/null | wc -l | tr -d ' ')
 
-          echo "op_saved=${op_saved}" >> "$GITHUB_OUTPUT"
-          echo "tp_saved=${tp_saved}" >> "$GITHUB_OUTPUT"
+          # Keep log-derived counters for diagnostics only.
+          op_miss=$(grep -c '\[build-cache\] MISS domain=custom_operator' /tmp/seed-build.log || true)
+          op_saved_log=$(grep -c '\[build-cache\] SAVED domain=custom_operator' /tmp/seed-build.log || true)
+          tp_miss=$(grep -c '\[build-cache\] MISS domain=third_party' /tmp/seed-build.log || true)
+          tp_saved_log=$(grep -c '\[build-cache\] SAVED domain=third_party' /tmp/seed-build.log || true)
+
+          echo "op_saved=${op_entries}" >> "$GITHUB_OUTPUT"
+          echo "tp_saved=${tp_entries}" >> "$GITHUB_OUTPUT"
 
           cache_size=$(du -sh "$BUILD_CACHE_DIR" | awk '{print $1}')
+
           echo "cold_seconds=$((end-start))"
-          echo "operator MISS=${op_miss} SAVED=${op_saved}"
-          echo "third_party MISS=${tp_miss} SAVED=${tp_saved}"
+          echo "operator manifests=${op_entries}; log MISS=${op_miss} SAVED=${op_saved_log}"
+          echo "third_party manifests=${tp_entries}; log MISS=${tp_miss} SAVED=${tp_saved_log}"
           echo "cache_size=${cache_size}"
 
-          if [ "$op_miss" -le 0 ] || [ "$op_saved" -le 0 ]; then
-            echo "::error::Cold build did not populate custom-operator cache."
+          if [ "$op_entries" -le 0 ]; then
+            echo "::error::Cold build produced no custom-operator cache manifests."
+            echo "::group::build-cache directory"
+            find "$BUILD_CACHE_DIR" -maxdepth 5 -print 2>/dev/null | head -300 || true
+            echo "::endgroup::"
             exit 1
           fi
-
-          {
-            echo "## Incremental cache seed"
-            echo "- source: \`${{ steps.source.outputs.source_sha }}\`"
-            echo "- operator: MISS=${op_miss}, SAVED=${op_saved}"
-            echo "- third-party: MISS=${tp_miss}, SAVED=${tp_saved}"
-            echo "- cold build: $((end-start))s"
-            echo "- cache size: ${cache_size}"
-          } >> "$GITHUB_STEP_SUMMARY"
-
       - name: Save incremental build cache to GitHub cache
         uses: actions/cache/save@v4
         with:
@@ -236,7 +237,7 @@ jobs:
           set -u
 
           start=$(date +%s)
-          uv pip install -e . 2>&1 | tee /tmp/reuse-build.log
+          uv pip install -v -e . 2>&1 | tee /tmp/reuse-build.log
           end=$(date +%s)
 
           op_hit=$(grep -c '\[build-cache\] HIT domain=custom_operator' /tmp/reuse-build.log || true)
