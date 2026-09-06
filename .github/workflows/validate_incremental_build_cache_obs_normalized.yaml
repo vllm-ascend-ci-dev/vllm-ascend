@@ -85,8 +85,13 @@ jobs:
           UV_SYSTEM_PYTHON: "1"
         run: |
           set -euo pipefail
+          # Vendor environment scripts read optional shell variables such as
+          # ZSH_VERSION without guarding them. Temporarily disable nounset only
+          # while sourcing them, then restore strict mode for our own script.
+          set +u
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
           source /usr/local/Ascend/nnal/atb/set_env.sh
+          set -u
           arch=$(uname -i)
           export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/Ascend/ascend-toolkit/latest/${arch}-linux/devlib"
           pip install uc-manager
@@ -102,8 +107,13 @@ jobs:
           rm -rf "$BUILD_CACHE_DIR" csrc/build build
           mkdir -p "$BUILD_CACHE_DIR"
 
+          # Vendor environment scripts read optional shell variables such as
+          # ZSH_VERSION without guarding them. Temporarily disable nounset only
+          # while sourcing them, then restore strict mode for our own script.
+          set +u
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
           source /usr/local/Ascend/nnal/atb/set_env.sh
+          set -u
 
           start=$(date +%s)
           uv pip install -e . 2>&1 | tee /tmp/seed-build.log
@@ -184,8 +194,13 @@ jobs:
           UV_SYSTEM_PYTHON: "1"
         run: |
           set -euo pipefail
+          # Vendor environment scripts read optional shell variables such as
+          # ZSH_VERSION without guarding them. Temporarily disable nounset only
+          # while sourcing them, then restore strict mode for our own script.
+          set +u
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
           source /usr/local/Ascend/nnal/atb/set_env.sh
+          set -u
           arch=$(uname -i)
           export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/Ascend/ascend-toolkit/latest/${arch}-linux/devlib"
           pip install uc-manager
@@ -218,8 +233,13 @@ jobs:
           set -euo pipefail
           rm -rf csrc/build build
 
+          # Vendor environment scripts read optional shell variables such as
+          # ZSH_VERSION without guarding them. Temporarily disable nounset only
+          # while sourcing them, then restore strict mode for our own script.
+          set +u
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
           source /usr/local/Ascend/nnal/atb/set_env.sh
+          set -u
 
           start=$(date +%s)
           uv pip install -e . 2>&1 | tee /tmp/reuse-build.log
