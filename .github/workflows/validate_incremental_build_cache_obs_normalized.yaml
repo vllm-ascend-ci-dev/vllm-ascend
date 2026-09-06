@@ -20,6 +20,16 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # Match the existing vLLM-Ascend csrc-cache workflow: uv installs into the
+  # container's system Python rather than requiring a virtual environment.
+  UV_INDEX_URL: http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+  UV_EXTRA_INDEX_URL: "https://repo.huaweicloud.com/ascend/repos/pypi http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+  UV_INDEX_STRATEGY: unsafe-best-match
+  UV_INSECURE_HOST: cache-service.nginx-pypi-cache.svc.cluster.local
+  UV_HTTP_TIMEOUT: "120"
+  UV_NO_CACHE: "1"
+  UV_SYSTEM_PYTHON: "1"
+
   SOC_VERSION: ascend910b1
   MAX_JOBS: "16"
   BUILD_CACHE_DIR: /tmp/vllm-ascend-incremental-build-cache
@@ -75,14 +85,6 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Install build dependencies
-        env:
-          UV_INDEX_URL: http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
-          UV_EXTRA_INDEX_URL: "https://repo.huaweicloud.com/ascend/repos/pypi http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
-          UV_INDEX_STRATEGY: unsafe-best-match
-          UV_INSECURE_HOST: cache-service.nginx-pypi-cache.svc.cluster.local
-          UV_HTTP_TIMEOUT: "120"
-          UV_NO_CACHE: "1"
-          UV_SYSTEM_PYTHON: "1"
         run: |
           set -euo pipefail
           # Vendor environment scripts read optional shell variables such as
@@ -184,14 +186,6 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Install build dependencies
-        env:
-          UV_INDEX_URL: http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
-          UV_EXTRA_INDEX_URL: "https://repo.huaweicloud.com/ascend/repos/pypi http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
-          UV_INDEX_STRATEGY: unsafe-best-match
-          UV_INSECURE_HOST: cache-service.nginx-pypi-cache.svc.cluster.local
-          UV_HTTP_TIMEOUT: "120"
-          UV_NO_CACHE: "1"
-          UV_SYSTEM_PYTHON: "1"
         run: |
           set -euo pipefail
           # Vendor environment scripts read optional shell variables such as
