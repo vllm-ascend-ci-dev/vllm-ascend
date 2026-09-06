@@ -37,7 +37,7 @@ env:
 jobs:
   obs-smoke-write:
     name: OBS smoke test - write
-    runs-on: linux-arm64-cpu-16
+    runs-on: linux-aarch64-a2-2
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
     outputs:
@@ -72,7 +72,7 @@ jobs:
   obs-smoke-read:
     name: OBS smoke test - read only
     needs: obs-smoke-write
-    runs-on: linux-arm64-cpu-16
+    runs-on: linux-aarch64-a2-2
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
 
@@ -108,7 +108,7 @@ jobs:
     name: Seed incremental build cache into OBS
     needs: obs-smoke-read
     timeout-minutes: 90
-    runs-on: linux-arm64-cpu-16
+    runs-on: linux-aarch64-a2-2
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
 
@@ -241,7 +241,7 @@ jobs:
     name: Restore OBS cache on fresh runner
     needs: seed-cache
     timeout-minutes: 60
-    runs-on: linux-arm64-cpu-16
+    runs-on: linux-aarch64-a2-2
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
 
