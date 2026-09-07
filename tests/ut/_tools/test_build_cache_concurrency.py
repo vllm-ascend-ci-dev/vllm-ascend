@@ -291,12 +291,16 @@ def test_many_parallel_hits_complete_without_hang(tmp_path: Path):
 
     # Recreate the disposable build-tree side of publication state. Only the
     # persistent content-addressed cache survives, matching a fresh CI runner.
-    if publish.exists():
-        import shutil
-        shutil.rmtree(publish)
-    if state.exists():
-        import shutil
-        shutil.rmtree(state)
+    #
+    # Keep the same logical stage paths for the HIT wave. The stage path is part
+    # of the wrapped command and therefore participates in recipe_hash unless it
+    # is normalized. The real CMake integration recreates the same relative
+    # action-stage path in a fresh build tree, so changing "seed-stages" to
+    # "hit-stages" here would incorrectly manufacture a cache MISS.
+    import shutil
+    shutil.rmtree(publish, ignore_errors=True)
+    shutil.rmtree(state, ignore_errors=True)
+    shutil.rmtree(tmp_path / "seed-stages", ignore_errors=True)
 
     env = os.environ.copy()
     env.update(
@@ -307,18 +311,10 @@ def test_many_parallel_hits_complete_without_hang(tmp_path: Path):
     )
 
     processes = []
-    for index, (command, _) in enumerate(commands):
-        # Stage paths are disposable; use a fresh namespace for the HIT wave.
-        rewritten = list(command)
-        output_index = rewritten.index("--output-dir") + 1
-        command_tail_index = rewritten.index("--")
-        new_stage = tmp_path / "hit-stages" / str(index)
-        rewritten[output_index] = str(new_stage)
-        # The fake builder's output path follows --output-dir.
-        rewritten[command_tail_index + 3] = str(new_stage)
+    for command, _ in commands:
         processes.append(
             subprocess.Popen(
-                rewritten,
+                command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
