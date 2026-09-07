@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import fnmatch
 import hashlib
@@ -31,6 +32,13 @@ SCHEMA_VERSION = 3
 ARTIFACT_MODEL_BY_DOMAIN = {"third_party": 1, "custom_operator": 2}
 PUBLISH_STATE_SCHEMA = 1
 CHUNK_SIZE = 1024 * 1024
+EVENT_LOG_ENV = "VLLM_ASCEND_BUILD_CACHE_EVENT_LOG"
+LOCK_POLL_SECONDS = 0.05
+LOCK_WAIT_EVENT_SECONDS = 1.0
+DEFAULT_ENTRY_LOCK_TIMEOUT_SECONDS = 60.0
+DEFAULT_ACTION_LOCK_TIMEOUT_SECONDS = 120.0
+DEFAULT_PUBLISH_LOCK_TIMEOUT_SECONDS = 120.0
+DEFAULT_GENERIC_LOCK_TIMEOUT_SECONDS = 120.0
 DEFAULT_EXCLUDES = (
     ".git",
     ".git/**",
@@ -63,6 +71,190 @@ _TEXT_SUFFIXES = {
     ".toml",
     ".md",
 }
+
+
+class _LockTimeoutError(Exception):
+    def __init__(
+        self,
+        *,
+        kind: str,
+        path: Path,
+        waited_seconds: float,
+    ) -> None:
+        self.kind = kind
+        self.path = path
+        self.waited_seconds = waited_seconds
+        super().__init__(
+            f"{kind} lock timeout after {waited_seconds:.3f}s: {path}"
+        )
+
+
+class _IndexLockBusy(RuntimeError):
+    pass
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    return max(0.0, parsed)
+
+
+def _emit_event(event: str, **fields) -> None:
+    # Best-effort JSONL telemetry; it must never affect build correctness.
+    event_log = os.environ.get(EVENT_LOG_ENV)
+    if not event_log:
+        return
+
+    payload = {
+        "timestamp_ns": time.time_ns(),
+        "pid": os.getpid(),
+        "event": event,
+        **fields,
+    }
+    encoded = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+    path = Path(event_log).expanduser()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o644,
+        )
+        try:
+            # One append/write per event. There is deliberately no telemetry
+            # lock: observability must never serialize compilation.
+            os.write(fd, encoded)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _measure_phase(
+    phase: str,
+    function,
+    *args,
+    event_fields: dict | None = None,
+    **kwargs,
+):
+    fields = event_fields or {}
+    _emit_event("phase_start", phase=phase, **fields)
+    start = time.monotonic()
+    try:
+        return function(*args, **kwargs)
+    finally:
+        _emit_event(
+            "phase_end",
+            phase=phase,
+            seconds=round(time.monotonic() - start, 6),
+            **fields,
+        )
+
+
+def _lock_kind(path: Path) -> str:
+    if path.name == "cache_index.json.lock":
+        return "index"
+    if path.name == ".publish.lock":
+        return "publish"
+    if path.parent.name == ".action_locks":
+        return "action"
+    return "generic"
+
+
+def _lock_timeout_seconds(kind: str) -> float:
+    if kind == "entry":
+        return _env_float(
+            "VLLM_ASCEND_BUILD_CACHE_ENTRY_LOCK_TIMEOUT_SECONDS",
+            DEFAULT_ENTRY_LOCK_TIMEOUT_SECONDS,
+        )
+    if kind == "action":
+        return _env_float(
+            "VLLM_ASCEND_BUILD_CACHE_ACTION_LOCK_TIMEOUT_SECONDS",
+            DEFAULT_ACTION_LOCK_TIMEOUT_SECONDS,
+        )
+    if kind == "publish":
+        return _env_float(
+            "VLLM_ASCEND_BUILD_CACHE_PUBLISH_LOCK_TIMEOUT_SECONDS",
+            DEFAULT_PUBLISH_LOCK_TIMEOUT_SECONDS,
+        )
+    return _env_float(
+        "VLLM_ASCEND_BUILD_CACHE_LOCK_TIMEOUT_SECONDS",
+        DEFAULT_GENERIC_LOCK_TIMEOUT_SECONDS,
+    )
+
+
+def _acquire_timed_lock(
+    stream,
+    path: Path,
+    *,
+    kind: str,
+    timeout_seconds: float,
+) -> float:
+    start = time.monotonic()
+    next_wait_event = LOCK_WAIT_EVENT_SECONDS
+
+    while True:
+        try:
+            fcntl.flock(
+                stream.fileno(),
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+            waited = time.monotonic() - start
+            if waited >= LOCK_WAIT_EVENT_SECONDS:
+                _emit_event(
+                    "lock_acquired",
+                    lock=kind,
+                    path=str(path),
+                    waited_seconds=round(waited, 6),
+                )
+            return waited
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+
+        waited = time.monotonic() - start
+        if waited >= timeout_seconds:
+            _emit_event(
+                "lock_timeout",
+                lock=kind,
+                path=str(path),
+                waited_seconds=round(waited, 6),
+            )
+            raise _LockTimeoutError(
+                kind=kind,
+                path=path,
+                waited_seconds=waited,
+            )
+
+        if waited >= next_wait_event:
+            _emit_event(
+                "lock_wait",
+                lock=kind,
+                path=str(path),
+                waited_seconds=round(waited, 6),
+            )
+            next_wait_event += 5.0
+
+        time.sleep(
+            min(
+                LOCK_POLL_SECONDS,
+                max(0.0, timeout_seconds - waited),
+            )
+        )
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -649,7 +841,30 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
 def _file_lock(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        kind = _lock_kind(path)
+        if kind == "index":
+            try:
+                fcntl.flock(
+                    stream.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                _emit_event(
+                    "index_skipped",
+                    lock="index",
+                    path=str(path),
+                    reason="lock_busy",
+                )
+                raise _IndexLockBusy(str(path)) from None
+        else:
+            _acquire_timed_lock(
+                stream,
+                path,
+                kind=kind,
+                timeout_seconds=_lock_timeout_seconds(kind),
+            )
         try:
             yield
         finally:
@@ -667,8 +882,13 @@ def _file_lock_or_error(path: Path):
 
     with stream:
         try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        except OSError as exc:
+            _acquire_timed_lock(
+                stream,
+                path,
+                kind="entry",
+                timeout_seconds=_lock_timeout_seconds("entry"),
+            )
+        except (OSError, _LockTimeoutError) as exc:
             yield exc
             return
         try:
@@ -1006,10 +1226,19 @@ def _publish_action_artifacts(
 def _safe_update_index(*args, **kwargs) -> None:
     try:
         _update_index(*args, **kwargs)
+    except _IndexLockBusy:
+        # Index metadata is observational only. A busy index must never
+        # serialize or delay the build/cache correctness path.
+        return
     except (OSError, RuntimeError, ValueError) as exc:
         print(
             f"[build-cache] WARNING index update failed: {exc}",
             flush=True,
+        )
+        _emit_event(
+            "warning",
+            component="index",
+            message=str(exc),
         )
 
 
@@ -1125,6 +1354,13 @@ def _parse_set_env(values: Sequence[str]) -> dict[str, str]:
 
 def run(args: argparse.Namespace) -> int:
     cache_root = Path(args.cache_root).expanduser().resolve()
+    event_fields = {
+        "domain": args.domain,
+        "unit": args.unit,
+        "action": args.action,
+        "soc": args.soc,
+    }
+    _emit_event("action_start", **event_fields)
     prepared_inputs = [Path(value) for value in args.prepared_input]
     recipe_files = [Path(value) for value in args.recipe_file]
     environment_files = [Path(value) for value in args.environment_file]
@@ -1151,31 +1387,43 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("missing build command after --")
 
     excludes = tuple(DEFAULT_EXCLUDES) + tuple(args.exclude)
-    prepared_input_hash, prepared_manifest = _hash_prepared_inputs(
+    prepared_input_hash, prepared_manifest = _measure_phase(
+        "hash_prepared_inputs",
+        _hash_prepared_inputs,
         prepared_inputs,
         excludes,
+        event_fields=event_fields,
     )
 
     operator_text_hash: str | None = None
     operator_text_manifest: list[dict] = []
     if args.domain == "custom_operator":
         repo_root = Path(args.repo_root) if args.repo_root else None
-        operator_text_hash, operator_text_manifest = _hash_operator_text(
+        operator_text_hash, operator_text_manifest = _measure_phase(
+            "hash_operator_text",
+            _hash_operator_text,
             Path(args.operator_source),
             repo_root,
+            event_fields=event_fields,
         )
 
-    recipe_hash, recipe_manifest = _hash_recipe(
+    recipe_hash, recipe_manifest = _measure_phase(
+        "hash_recipe",
+        _hash_recipe,
         recipe_files,
         args.recipe_value,
         command,
         normalize_paths,
+        event_fields=event_fields,
     )
-    environment_hash, environment_manifest = _hash_compiler_environment(
+    environment_hash, environment_manifest = _measure_phase(
+        "hash_compiler_environment",
+        _hash_compiler_environment,
         args.environment_profile,
         environment_files,
         args.environment_value,
         args.environment_tool,
+        event_fields=event_fields,
     )
     final_key = _canonical_hash(
         [
@@ -1236,12 +1484,15 @@ def run(args: argparse.Namespace) -> int:
         assert publish_dir is not None
         assert publish_state_dir is not None
         action_identity = f"{args.unit}/{args.action}"
-        _publish_action_artifacts(
+        _measure_phase(
+            "publish",
+            _publish_action_artifacts,
             source_root=output_dir,
             publish_dir=publish_dir,
             publish_state_dir=publish_state_dir,
             action_identity=action_identity,
             artifacts=artifacts,
+            event_fields=event_fields,
         )
 
     def build_without_cache(reason: str) -> int:
@@ -1249,6 +1500,12 @@ def run(args: argparse.Namespace) -> int:
             f"[build-cache] BYPASS domain={args.domain} unit={args.unit} "
             f"reason={reason}",
             flush=True,
+        )
+        _emit_event(
+            "cache_result",
+            status="BYPASS",
+            reason=reason,
+            **event_fields,
         )
         if args.domain == "custom_operator":
             _reset_private_output(output_dir)
@@ -1298,18 +1555,38 @@ def run(args: argparse.Namespace) -> int:
                     f"cache lock unavailable: {lock_error}"
                 )
 
-            manifest = _validate_entry(entry, final_key, args.domain)
+            manifest = _measure_phase(
+                "validate_entry",
+                _validate_entry,
+                entry,
+                final_key,
+                args.domain,
+                event_fields=event_fields,
+            )
             if manifest is not None:
                 try:
                     if args.domain == "custom_operator":
                         _reset_private_output(output_dir)
-                    _restore_entry(entry, output_dir, manifest)
+                    _measure_phase(
+                        "restore_entry",
+                        _restore_entry,
+                        entry,
+                        output_dir,
+                        manifest,
+                        event_fields=event_fields,
+                    )
                     if args.domain == "custom_operator":
                         publish_custom(manifest["artifacts"])
                     print(
                         f"[build-cache] HIT domain={args.domain} "
                         f"unit={args.unit} key={final_key}",
                         flush=True,
+                    )
+                    _emit_event(
+                        "cache_result",
+                        status="HIT",
+                        key=final_key,
+                        **event_fields,
                     )
                     update_index("HIT")
                     return 0
@@ -1320,6 +1597,13 @@ def run(args: argparse.Namespace) -> int:
                         f"key={final_key}: {exc}",
                         flush=True,
                     )
+                    _emit_event(
+                        "warning",
+                        component="restore",
+                        key=final_key,
+                        message=str(exc),
+                        **event_fields,
+                    )
                     if args.domain == "custom_operator":
                         _reset_private_output(output_dir)
 
@@ -1327,6 +1611,12 @@ def run(args: argparse.Namespace) -> int:
                 f"[build-cache] MISS domain={args.domain} unit={args.unit} "
                 f"key={final_key}",
                 flush=True,
+            )
+            _emit_event(
+                "cache_result",
+                status="MISS",
+                key=final_key,
+                **event_fields,
             )
 
             if args.domain == "custom_operator":
@@ -1370,12 +1660,27 @@ def run(args: argparse.Namespace) -> int:
                     f"build_seconds={elapsed:.3f}",
                     flush=True,
                 )
+                _emit_event(
+                    "cache_result",
+                    status="SAVED",
+                    key=final_key,
+                    artifacts=len(artifacts),
+                    build_seconds=round(elapsed, 6),
+                    **event_fields,
+                )
             except (OSError, RuntimeError) as exc:
                 print(
                     f"[build-cache] WARNING save failed; build result kept "
                     f"domain={args.domain} unit={args.unit} "
                     f"key={final_key}: {exc}",
                     flush=True,
+                )
+                _emit_event(
+                    "warning",
+                    component="save",
+                    key=final_key,
+                    message=str(exc),
+                    **event_fields,
                 )
 
             update_index("MISS_BUILT" if cache_saved else "MISS_UNCACHED")
@@ -1432,7 +1737,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(f"unsupported subcommand: {args.subcommand}")
     if args.command and args.command[0] == "--":
         args.command = args.command[1:]
-    return run(args)
+    try:
+        return run(args)
+    except _LockTimeoutError as exc:
+        print(
+            f"[build-cache] ERROR lock timeout kind={exc.kind} "
+            f"waited_seconds={exc.waited_seconds:.3f} path={exc.path}",
+            flush=True,
+        )
+        _emit_event(
+            "error",
+            error="lock_timeout",
+            lock=exc.kind,
+            path=str(exc.path),
+            waited_seconds=round(exc.waited_seconds, 6),
+        )
+        return 75
 
 
 if __name__ == "__main__":
