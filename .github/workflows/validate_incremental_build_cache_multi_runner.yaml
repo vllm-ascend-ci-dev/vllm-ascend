@@ -1,12 +1,20 @@
-name: Validate incremental build cache across runners
+name: Validate incremental build cache per device
 
 on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: Source ref containing incremental-cache implementation
+        description: Feature branch / commit containing incremental build cache
         required: true
         default: feat/local-incremental-build-cache
+      a5_image:
+        description: A5 CANN 9.1.0 build image
+        required: true
+        default: quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.12
+      a5_soc:
+        description: A5 SOC_VERSION for this runner
+        required: true
+        default: ascend950dt_9582
 
 permissions:
   contents: read
@@ -14,10 +22,6 @@ permissions:
 defaults:
   run:
     shell: bash -el {0}
-
-concurrency:
-  group: incremental-build-cache-validation-${{ github.ref }}
-  cancel-in-progress: false
 
 env:
   UV_INDEX_URL: http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
@@ -27,26 +31,46 @@ env:
   UV_HTTP_TIMEOUT: "120"
   UV_NO_CACHE: "1"
   UV_SYSTEM_PYTHON: "1"
-
-  SOC_VERSION: ascend910b1
   COMPILE_CUSTOM_KERNELS: "1"
   MAX_JOBS: "16"
-  BUILD_CACHE_DIR: /tmp/vllm-ascend-incremental-build-cache
-  CACHE_EVENT_LOG: /tmp/vllm-ascend-build-cache-events.jsonl
-  CACHE_BUILD_LOG: /tmp/vllm-ascend-pip-build.log
-
   VLLM_ASCEND_BUILD_CACHE_ENTRY_LOCK_TIMEOUT_SECONDS: "60"
   VLLM_ASCEND_BUILD_CACHE_ACTION_LOCK_TIMEOUT_SECONDS: "120"
   VLLM_ASCEND_BUILD_CACHE_PUBLISH_LOCK_TIMEOUT_SECONDS: "120"
 
-
 jobs:
-  cache-runtime-stress:
-    name: Runtime concurrency and resilience
-    runs-on: linux-aarch64-a5-2
-    timeout-minutes: 20
+  validate:
+    name: "${{ matrix.id }}: cold -> reuse -> incremental"
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: a2
+            runner: linux-aarch64-a2-2
+            image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
+            soc: ascend910b1
+          - id: a3
+            runner: linux-aarch64-a3-2
+            image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-a3-ubuntu22.04-py3.12
+            soc: ascend910_9391
+          - id: a5
+            runner: linux-aarch64-a5-2
+            image: ${{ inputs.a5_image }}
+            soc: ${{ inputs.a5_soc }}
+          - id: 310p
+            runner: linux-aarch64-310p-2
+            image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-310p-ubuntu22.04-py3.12
+            soc: ascend310p1
+
+    runs-on: ${{ matrix.runner }}
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
+      image: ${{ matrix.image }}
+
+    env:
+      SOC_VERSION: ${{ matrix.soc }}
+      BUILD_CACHE_DIR: /tmp/vllm-ascend-incremental-build-cache-${{ matrix.id }}
+      BASELINE_JSON: /tmp/vllm-ascend-cache-baseline-${{ matrix.id }}.json
+      PROBE_JSON: /tmp/vllm-ascend-cache-probe-${{ matrix.id }}.json
 
     steps:
       - name: Checkout source
@@ -54,837 +78,940 @@ jobs:
         with:
           ref: ${{ inputs.source_ref }}
           fetch-depth: 0
+          submodules: recursive
 
       - name: Trust checkout for git introspection
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Run cache-engine unit and stress tests
+      - name: Install build dependencies
         run: |
           set -euo pipefail
+
+          sed -Ei 's@(ports|archive).ubuntu.com@cache-service.nginx-pypi-cache.svc.cluster.local:8081@g' /etc/apt/sources.list
           pip config set global.index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple >/dev/null
           pip config set global.trusted-host cache-service.nginx-pypi-cache.svc.cluster.local >/dev/null
-          python -m pip install -q pytest
 
-          echo "Running complete build-cache unit suite"
+          {
+            apt-get update -qq
+            xargs apt-get -y -qq install < packages.txt
+            apt-get -y -qq install gcc g++ cmake libnuma-dev clang-15 git zstd
+          } >/tmp/system-deps-${{ matrix.id }}.log 2>&1 || {
+            echo "::error::System dependency installation failed"
+            tail -200 /tmp/system-deps-${{ matrix.id }}.log
+            exit 1
+          }
+
+          update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20 >/dev/null
+          update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20 >/dev/null
+          python -m pip install -q uv uc-manager pytest
+
+          {
+            uv pip install -r requirements-dev.txt
+            uv pip install --force-reinstall --no-deps triton-ascend==3.2.2
+          } >/tmp/python-deps-${{ matrix.id }}.log 2>&1 || {
+            echo "::error::Python dependency installation failed"
+            tail -200 /tmp/python-deps-${{ matrix.id }}.log
+            exit 1
+          }
+
+      - name: Print target and compiler environment
+        run: |
+          set -euo pipefail
+          set +u
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then
+            source /usr/local/Ascend/nnal/atb/set_env.sh
+          fi
+          set -u
+
+          echo "================ TARGET ENVIRONMENT ================"
+          echo "matrix.id=${{ matrix.id }}"
+          echo "runner.label=${{ matrix.runner }}"
+          echo "container.image=${{ matrix.image }}"
+          echo "source.sha=$(git rev-parse HEAD)"
+          echo "SOC_VERSION=${SOC_VERSION}"
+          echo "hostname=$(hostname)"
+          echo "uname=$(uname -a)"
+          echo "python=$(python --version 2>&1)"
+          echo "cmake=$(cmake --version | head -1)"
+          echo "machine=$(uname -m)"
+
+          echo "---- compiler identity ----"
+          command -v bisheng || true
+          bisheng --version 2>&1 | head -10 || true
+          command -v ccec || true
+          ccec --version 2>&1 | head -10 || true
+
+          echo "---- CANN metadata ----"
+          for f in \
+            "${ASCEND_HOME_PATH:-}/version.info" \
+            "${ASCEND_HOME_PATH:-}/ascend_toolkit_install.info" \
+            "${ASCEND_TOOLKIT_HOME:-}/version.info" \
+            /etc/ascend_install.info; do
+            if [ -f "$f" ]; then
+              echo "[$f]"
+              head -50 "$f"
+              sha256sum "$f"
+            fi
+          done
+          echo "===================================================="
+
+      - name: Create diagnostics helper
+        run: |
+          cat >/tmp/cache_ci_diag.py <<'PY'
+          from __future__ import annotations
+
+          import argparse
+          import collections
+          import json
+          from pathlib import Path
+          import subprocess
+
+
+          HASH_FIELDS = (
+              "final_key",
+              "prepared_input_hash",
+              "recipe_hash",
+              "compiler_environment_hash",
+              "operator_text_hash",
+          )
+
+
+          def load_events(path):
+              events = []
+              path = Path(path)
+              if not path.exists():
+                  return events
+              for line in path.read_text(encoding="utf-8").splitlines():
+                  if not line.strip():
+                      continue
+                  try:
+                      events.append(json.loads(line))
+                  except json.JSONDecodeError:
+                      print(f"[diag] malformed event line: {line[:200]}")
+              return events
+
+
+          def load_manifests(root):
+              root = Path(root)
+              manifests = []
+              if not root.exists():
+                  return manifests
+              for path in root.rglob("manifest.json"):
+                  try:
+                      payload = json.loads(path.read_text(encoding="utf-8"))
+                  except Exception as exc:
+                      print(f"[diag] cannot read manifest {path}: {exc}")
+                      continue
+                  payload["_manifest_path"] = str(path)
+                  manifests.append(payload)
+              return manifests
+
+
+          def manifest_identity(m):
+              if m.get("domain") == "third_party":
+                  return ("third_party", m.get("unit"))
+              return (
+                  "custom_operator",
+                  m.get("soc"),
+                  m.get("unit") or m.get("operator"),
+                  m.get("action"),
+              )
+
+
+          def event_identity(e):
+              if e.get("domain") == "third_party":
+                  return ("third_party", e.get("unit"))
+              return (
+                  "custom_operator",
+                  e.get("soc"),
+                  e.get("unit"),
+                  e.get("action"),
+              )
+
+
+          def snapshot(root):
+              manifests = load_manifests(root)
+              by_identity = {}
+              for m in manifests:
+                  item = {
+                      key: m.get(key) for key in HASH_FIELDS
+                  } | {
+                      "domain": m.get("domain"),
+                      "unit": m.get("unit"),
+                      "soc": m.get("soc"),
+                      "operator": m.get("operator"),
+                      "action": m.get("action"),
+                      "artifact_count": len(m.get("artifacts", [])),
+                      "manifest_path": m.get("_manifest_path"),
+                  }
+                  by_identity.setdefault(repr(manifest_identity(m)), []).append(item)
+              return manifests, by_identity
+
+
+          def short(value):
+              if value is None:
+                  return "<none>"
+              value = str(value)
+              return value if len(value) <= 20 else value[:16] + "..."
+
+
+          def print_manifests(manifests, title):
+              print(f"\n================ {title} ================")
+              op = [m for m in manifests if m.get("domain") == "custom_operator"]
+              tp = [m for m in manifests if m.get("domain") == "third_party"]
+              counts = collections.Counter(
+                  (m.get("operator") or m.get("unit")) for m in op
+              )
+              print(f"custom_operator entries={len(op)}")
+              print(f"unique operators={len(counts)}")
+              print("operator action counts:")
+              for operator, count in sorted(counts.items()):
+                  print(f"  {operator}: {count}")
+
+              print(f"third_party entries={len(tp)}")
+              for m in tp:
+                  print(
+                      "  "
+                      f"unit={m.get('unit')} "
+                      f"key={short(m.get('final_key'))} "
+                      f"prepared={short(m.get('prepared_input_hash'))} "
+                      f"recipe={short(m.get('recipe_hash'))} "
+                      f"env={short(m.get('compiler_environment_hash'))} "
+                      f"artifacts={len(m.get('artifacts', []))}"
+                  )
+              print("====================================================")
+
+
+          def event_results(events, title):
+              results = [e for e in events if e.get("event") == "cache_result"]
+              counts = collections.Counter(
+                  (e.get("domain"), e.get("status")) for e in results
+              )
+              print(f"\n================ {title} ================")
+              for (domain, status), count in sorted(
+                  counts.items(), key=lambda item: str(item[0])
+              ):
+                  print(f"{domain:16s} {status:8s} {count}")
+
+              waits = [e for e in events if e.get("event") == "lock_wait"]
+              timeouts = [e for e in events if e.get("event") == "lock_timeout"]
+              skipped = [e for e in events if e.get("event") == "index_skipped"]
+              print(f"lock_wait events={len(waits)}")
+              print(f"lock_timeout events={len(timeouts)}")
+              print(f"index_skipped events={len(skipped)}")
+              if waits:
+                  print("longest lock waits:")
+                  for e in sorted(
+                      waits,
+                      key=lambda x: float(x.get("waited_seconds", 0)),
+                      reverse=True,
+                  )[:10]:
+                      print(
+                          f"  lock={e.get('lock')} "
+                          f"wait={e.get('waited_seconds')}s "
+                          f"path={e.get('path')}"
+                      )
+              print("====================================================")
+              return results
+
+
+          def find_by_key(manifests, key):
+              matches = [m for m in manifests if m.get("final_key") == key]
+              return matches[-1] if matches else None
+
+
+          def explain_misses(baseline, manifests, misses):
+              print("\n================ MISS DIAGNOSTICS ================")
+              if not misses:
+                  print("no MISS events")
+                  print("==================================================")
+                  return
+
+              for event in misses:
+                  ident = event_identity(event)
+                  current_key = event.get("key")
+                  current = find_by_key(manifests, current_key)
+                  previous_entries = baseline["by_identity"].get(repr(ident), [])
+
+                  print(
+                      f"MISS domain={event.get('domain')} "
+                      f"unit={event.get('unit')} action={event.get('action')} "
+                      f"soc={event.get('soc')}"
+                  )
+                  print(f"  identity={ident}")
+                  print(f"  current_key={current_key}")
+
+                  if not previous_entries:
+                      print("  baseline=<no matching identity>")
+                      continue
+
+                  previous = previous_entries[-1]
+                  print(f"  baseline_key={previous.get('final_key')}")
+                  if current is None:
+                      print("  current manifest=<not found after build>")
+                      continue
+
+                  changed = []
+                  for field in HASH_FIELDS[1:]:
+                      before = previous.get(field)
+                      after = current.get(field)
+                      state = "CHANGED" if before != after else "same"
+                      if before != after:
+                          changed.append(field)
+                      print(f"  {field}: {state}")
+                      print(f"    baseline={before}")
+                      print(f"    current ={after}")
+                  print(
+                      "  changed_dimensions="
+                      + (", ".join(changed) if changed else "<none>")
+                  )
+              print("==================================================")
+
+
+          def do_baseline(args):
+              manifests, by_identity = snapshot(args.cache_root)
+              root = Path(args.cache_root)
+              items = [
+                  p for p in root.rglob("*")
+                  if p.is_file() or p.is_symlink()
+              ]
+              op = [m for m in manifests if m.get("domain") == "custom_operator"]
+              tp = [m for m in manifests if m.get("domain") == "third_party"]
+              if not op:
+                  raise SystemExit("ERROR: cold build produced no custom_operator manifests")
+              if not tp:
+                  raise SystemExit("ERROR: cold build produced no third_party manifests")
+
+              data = {
+                  "target": args.target,
+                  "soc": args.soc,
+                  "operator_entries": len(op),
+                  "third_party_entries": len(tp),
+                  "payload_bytes": sum(p.lstat().st_size for p in items),
+                  "payload_items": len(items),
+                  "by_identity": by_identity,
+              }
+              Path(args.output).write_text(
+                  json.dumps(data, indent=2, sort_keys=True),
+                  encoding="utf-8",
+              )
+              print_manifests(manifests, "COLD CACHE MANIFESTS")
+              print(f"cache payload bytes={data['payload_bytes']}")
+              print(f"cache payload items={data['payload_items']}")
+              print(f"baseline={args.output}")
+
+
+          def do_report(args):
+              baseline = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
+              events = load_events(args.events)
+              manifests = load_manifests(args.cache_root)
+              results = event_results(events, args.title)
+              explain_misses(
+                  baseline,
+                  manifests,
+                  [e for e in results if e.get("status") == "MISS"],
+              )
+
+
+          def do_validate_reuse(args):
+              baseline = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
+              events = load_events(args.events)
+              manifests = load_manifests(args.cache_root)
+              results = event_results(events, "FULL REUSE VERDICT INPUT")
+              explain_misses(
+                  baseline,
+                  manifests,
+                  [e for e in results if e.get("status") == "MISS"],
+              )
+
+              op_hit = sum(
+                  e.get("domain") == "custom_operator" and e.get("status") == "HIT"
+                  for e in results
+              )
+              op_miss = sum(
+                  e.get("domain") == "custom_operator" and e.get("status") == "MISS"
+                  for e in results
+              )
+              tp_hit = sum(
+                  e.get("domain") == "third_party" and e.get("status") == "HIT"
+                  for e in results
+              )
+              tp_miss = sum(
+                  e.get("domain") == "third_party" and e.get("status") == "MISS"
+                  for e in results
+              )
+              timeouts = sum(e.get("event") == "lock_timeout" for e in events)
+              expected_op = int(baseline["operator_entries"])
+              expected_tp = int(baseline["third_party_entries"])
+
+              failures = []
+              if op_hit != expected_op:
+                  failures.append(
+                      f"custom_operator HIT expected={expected_op} actual={op_hit}"
+                  )
+              if op_miss:
+                  failures.append(f"custom_operator MISS expected=0 actual={op_miss}")
+              if tp_hit != expected_tp:
+                  failures.append(
+                      f"third_party HIT expected={expected_tp} actual={tp_hit}"
+                  )
+              if tp_miss:
+                  failures.append(f"third_party MISS expected=0 actual={tp_miss}")
+              if timeouts:
+                  failures.append(f"lock_timeout expected=0 actual={timeouts}")
+
+              cold = int(args.cold_seconds)
+              warm = int(args.warm_seconds)
+              speedup = cold / max(warm, 1)
+
+              print("\n================ FULL REUSE VERDICT ================")
+              print(f"custom_operator HIT={op_hit}/{expected_op} MISS={op_miss}")
+              print(f"third_party HIT={tp_hit}/{expected_tp} MISS={tp_miss}")
+              print(f"lock_timeouts={timeouts}")
+              print(f"cold={cold}s warm={warm}s speedup={speedup:.2f}x")
+              if speedup < 2.0:
+                  print(
+                      f"WARNING: speedup {speedup:.2f}x is below provisional "
+                      "2.0x; reported only, not a correctness gate."
+                  )
+
+              if failures:
+                  print("RESULT=FAIL")
+                  for failure in failures:
+                      print(f"  - {failure}")
+                  print("====================================================")
+                  raise SystemExit(1)
+
+              print("RESULT=PASS")
+              print("====================================================")
+
+
+          def do_choose_probe(args):
+              baseline = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
+              counts = collections.Counter()
+              for entries in baseline["by_identity"].values():
+                  if not entries:
+                      continue
+                  m = entries[-1]
+                  if m.get("domain") == "custom_operator" and m.get("operator"):
+                      counts[m["operator"]] += 1
+
+              tracked = subprocess.check_output(
+                  ["git", "ls-files", "csrc"],
+                  text=True,
+              ).splitlines()
+              suffixes = {
+                  ".c", ".cc", ".cpp", ".cxx",
+                  ".h", ".hh", ".hpp", ".hxx",
+              }
+
+              chosen = None
+              for operator, action_count in sorted(
+                  counts.items(), key=lambda item: (item[1], item[0])
+              ):
+                  candidates = []
+                  for raw in tracked:
+                      path = Path(raw)
+                      if path.suffix.lower() not in suffixes:
+                          continue
+                      if operator not in path.parts:
+                          continue
+                      if "build" in path.parts or "third_party" in path.parts:
+                          continue
+                      candidates.append(path)
+                  if candidates:
+                      chosen = {
+                          "operator": operator,
+                          "expected_actions": action_count,
+                          "source_file": str(
+                              sorted(
+                                  candidates,
+                                  key=lambda p: (len(p.parts), str(p)),
+                              )[0]
+                          ),
+                      }
+                      break
+
+              if chosen is None:
+                  raise SystemExit(
+                      "ERROR: could not choose a tracked source-backed operator"
+                  )
+
+              Path(args.output).write_text(
+                  json.dumps(chosen, indent=2, sort_keys=True),
+                  encoding="utf-8",
+              )
+              print("\n================ INCREMENTAL PROBE ================")
+              for key, value in chosen.items():
+                  print(f"{key}={value}")
+              print("===================================================")
+
+
+          def do_validate_incremental(args):
+              baseline = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
+              probe = json.loads(Path(args.probe).read_text(encoding="utf-8"))
+              events = load_events(args.events)
+              manifests = load_manifests(args.cache_root)
+              results = event_results(events, "INCREMENTAL VERDICT INPUT")
+              explain_misses(
+                  baseline,
+                  manifests,
+                  [e for e in results if e.get("status") == "MISS"],
+              )
+
+              changed = probe["operator"]
+              expected_changed = int(probe["expected_actions"])
+              total = int(baseline["operator_entries"])
+              expected_tp = int(baseline["third_party_entries"])
+
+              op_hits = [
+                  e for e in results
+                  if e.get("domain") == "custom_operator"
+                  and e.get("status") == "HIT"
+              ]
+              op_misses = [
+                  e for e in results
+                  if e.get("domain") == "custom_operator"
+                  and e.get("status") == "MISS"
+              ]
+              op_saved = [
+                  e for e in results
+                  if e.get("domain") == "custom_operator"
+                  and e.get("status") == "SAVED"
+              ]
+              changed_misses = [e for e in op_misses if e.get("unit") == changed]
+              foreign_misses = [e for e in op_misses if e.get("unit") != changed]
+              changed_saved = [e for e in op_saved if e.get("unit") == changed]
+              tp_hit = sum(
+                  e.get("domain") == "third_party" and e.get("status") == "HIT"
+                  for e in results
+              )
+              tp_miss = sum(
+                  e.get("domain") == "third_party" and e.get("status") == "MISS"
+                  for e in results
+              )
+              timeouts = sum(e.get("event") == "lock_timeout" for e in events)
+
+              failures = []
+              if len(changed_misses) != expected_changed:
+                  failures.append(
+                      f"changed operator MISS expected={expected_changed} "
+                      f"actual={len(changed_misses)}"
+                  )
+              if len(changed_saved) != expected_changed:
+                  failures.append(
+                      f"changed operator SAVED expected={expected_changed} "
+                      f"actual={len(changed_saved)}"
+                  )
+              if foreign_misses:
+                  failures.append(
+                      "unrelated operators missed: "
+                      + ", ".join(
+                          f"{e.get('unit')}/{e.get('action')}"
+                          for e in foreign_misses
+                      )
+                  )
+              if len(op_hits) != total - expected_changed:
+                  failures.append(
+                      f"custom_operator HIT expected={total - expected_changed} "
+                      f"actual={len(op_hits)}"
+                  )
+              if tp_hit != expected_tp:
+                  failures.append(
+                      f"third_party HIT expected={expected_tp} actual={tp_hit}"
+                  )
+              if tp_miss:
+                  failures.append(f"third_party MISS expected=0 actual={tp_miss}")
+              if timeouts:
+                  failures.append(f"lock_timeout expected=0 actual={timeouts}")
+
+              print("\n================ INCREMENTAL VERDICT ================")
+              print(f"changed operator={changed}")
+              print(f"expected changed actions={expected_changed}")
+              print(
+                  f"custom_operator HIT={len(op_hits)} "
+                  f"MISS={len(op_misses)} SAVED={len(op_saved)}"
+              )
+              print(f"foreign MISS={len(foreign_misses)}")
+              print(f"third_party HIT={tp_hit}/{expected_tp} MISS={tp_miss}")
+              print(f"lock_timeouts={timeouts}")
+
+              if failures:
+                  print("RESULT=FAIL")
+                  for failure in failures:
+                      print(f"  - {failure}")
+                  print("====================================================")
+                  raise SystemExit(1)
+
+              print("RESULT=PASS")
+              print("====================================================")
+
+
+          def main():
+              parser = argparse.ArgumentParser()
+              sub = parser.add_subparsers(dest="command", required=True)
+
+              p = sub.add_parser("baseline")
+              p.add_argument("--cache-root", required=True)
+              p.add_argument("--output", required=True)
+              p.add_argument("--target", required=True)
+              p.add_argument("--soc", required=True)
+              p.set_defaults(func=do_baseline)
+
+              p = sub.add_parser("report")
+              p.add_argument("--cache-root", required=True)
+              p.add_argument("--baseline", required=True)
+              p.add_argument("--events", required=True)
+              p.add_argument("--title", required=True)
+              p.set_defaults(func=do_report)
+
+              p = sub.add_parser("validate-reuse")
+              p.add_argument("--cache-root", required=True)
+              p.add_argument("--baseline", required=True)
+              p.add_argument("--events", required=True)
+              p.add_argument("--cold-seconds", required=True)
+              p.add_argument("--warm-seconds", required=True)
+              p.set_defaults(func=do_validate_reuse)
+
+              p = sub.add_parser("choose-probe")
+              p.add_argument("--baseline", required=True)
+              p.add_argument("--output", required=True)
+              p.set_defaults(func=do_choose_probe)
+
+              p = sub.add_parser("validate-incremental")
+              p.add_argument("--cache-root", required=True)
+              p.add_argument("--baseline", required=True)
+              p.add_argument("--probe", required=True)
+              p.add_argument("--events", required=True)
+              p.set_defaults(func=do_validate_incremental)
+
+              args = parser.parse_args()
+              args.func(args)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          cat >/tmp/watch_cache_events.py <<'PY'
+          import json
+          import sys
+          import time
+
+          STALL_AFTER_SECONDS = 5.0
+          STALL_REPEAT_SECONDS = 10.0
+          actions = {}
+          phases = {}
+          last_stall = {}
+
+          def report_stalls():
+              now = time.time_ns()
+              for pid, state in list(phases.items()):
+                  elapsed = (now - state["started_ns"]) / 1e9
+                  if elapsed < STALL_AFTER_SECONDS:
+                      continue
+                  previous = last_stall.get(pid, 0.0)
+                  if previous and elapsed - previous < STALL_REPEAT_SECONDS:
+                      continue
+                  last_stall[pid] = elapsed
+                  unit, action = actions.get(pid, ("?", "?"))
+                  print(
+                      f"[cache] STALL pid={pid} {unit}/{action} "
+                      f"phase={state['phase']} elapsed={elapsed:.1f}s",
+                      flush=True,
+                  )
+
+          with open(sys.argv[1], "r", encoding="utf-8") as stream:
+              while True:
+                  line = stream.readline()
+                  if not line:
+                      report_stalls()
+                      time.sleep(0.1)
+                      continue
+                  try:
+                      e = json.loads(line)
+                  except json.JSONDecodeError:
+                      continue
+
+                  event = e.get("event")
+                  pid = e.get("pid")
+                  if event == "action_start":
+                      actions[pid] = (e.get("unit"), e.get("action"))
+                      print(
+                          f"[cache] START pid={pid} "
+                          f"{e.get('domain')}:{e.get('unit')}/{e.get('action')}",
+                          flush=True,
+                      )
+                  elif event == "phase_start":
+                      phases[pid] = {
+                          "phase": e.get("phase"),
+                          "started_ns": e.get("timestamp_ns", time.time_ns()),
+                      }
+                      last_stall.pop(pid, None)
+                  elif event == "phase_end":
+                      phases.pop(pid, None)
+                      last_stall.pop(pid, None)
+                  elif event == "cache_result":
+                      key = e.get("key") or ""
+                      print(
+                          f"[cache] {e.get('status')} "
+                          f"{e.get('domain')}:{e.get('unit')}/{e.get('action')} "
+                          f"key={key[:16]}",
+                          flush=True,
+                      )
+                  elif event in {
+                      "lock_wait",
+                      "lock_acquired",
+                      "lock_timeout",
+                      "index_skipped",
+                      "warning",
+                      "error",
+                  }:
+                      print("[cache] " + json.dumps(e, sort_keys=True), flush=True)
+
+                  report_stalls()
+          PY
+
+      - name: Cache runtime concurrency stress
+        run: |
+          set -euo pipefail
+          echo "================ RUNTIME STRESS ================"
           timeout 180s python -m pytest -q \
             --confcutdir=tests/ut/_tools \
             tests/ut/_tools/test_build_cache.py \
             tests/ut/_tools/test_build_cache_concurrency.py
+          echo "runtime stress RESULT=PASS"
+          echo "================================================"
 
-          echo "Repeating the high-concurrency HIT wave"
-          for round in 1 2 3 4 5; do
-            echo "[stress] round=${round}/5"
-            timeout 60s python -m pytest -q \
-              --confcutdir=tests/ut/_tools \
-              tests/ut/_tools/test_build_cache_concurrency.py \
-              -k many_parallel_hits_complete_without_hang
-          done
-
-      - name: Runtime stress summary
-        if: success()
-        run: |
-          {
-            echo "### Runtime concurrency and resilience"
-            echo "- Full build-cache UT suite: PASS"
-            echo "- 32-way parallel HIT stress: 5/5 PASS"
-            echo "- Timed entry/action/publish lock behavior: PASS"
-            echo "- Nonblocking cache index behavior: PASS"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  cache-seed-baseline:
-    name: Cold build and seed GitHub cache
-    runs-on: linux-aarch64-a2-2
-    timeout-minutes: 90
-    container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
-    outputs:
-      source_sha: ${{ steps.source.outputs.source_sha }}
-      cache_key: ${{ steps.cache-key.outputs.cache_key }}
-      cold_seconds: ${{ steps.build.outputs.build_seconds }}
-      operator_entries: ${{ steps.baseline.outputs.operator_entries }}
-      third_party_entries: ${{ steps.baseline.outputs.third_party_entries }}
-      payload_bytes: ${{ steps.baseline.outputs.payload_bytes }}
-      payload_items: ${{ steps.baseline.outputs.payload_items }}
-      changed_operator: ${{ steps.baseline.outputs.changed_operator }}
-      changed_operator_actions: ${{ steps.baseline.outputs.changed_operator_actions }}
-      changed_source_file: ${{ steps.baseline.outputs.changed_source_file }}
-
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.source_ref }}
-          fetch-depth: 0
-          submodules: recursive
-
-      - name: Trust checkout for git introspection
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Record immutable source
-        id: source
-        run: |
-          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Set validation cache key
-        id: cache-key
-        run: |
-          echo "cache_key=vllm-ascend-inc-validation-a2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
-
-      - name: Install build dependencies
-        run: |
-          set -euo pipefail
-
-          sed -Ei 's@(ports|archive).ubuntu.com@cache-service.nginx-pypi-cache.svc.cluster.local:8081@g' /etc/apt/sources.list
-          pip config set global.index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple >/dev/null
-          pip config set global.trusted-host cache-service.nginx-pypi-cache.svc.cluster.local >/dev/null
-
-          {
-            apt-get update -qq
-            xargs apt-get -y -qq install < packages.txt
-            apt-get -y -qq install gcc g++ cmake libnuma-dev clang-15 git zstd
-          } >/tmp/system-deps.log 2>&1 || {
-            tail -200 /tmp/system-deps.log
-            exit 1
-          }
-
-          update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20 >/dev/null
-          update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20 >/dev/null
-          python -m pip install -q uv uc-manager
-
-          {
-            uv pip install -r requirements-dev.txt
-            uv pip install --force-reinstall --no-deps triton-ascend==3.2.2
-          } >/tmp/python-deps.log 2>&1 || {
-            tail -200 /tmp/python-deps.log
-            exit 1
-          }
-
-      - name: Cold build and populate incremental cache
-        id: build
+      - name: Cold build
+        id: cold
         env:
           VLLM_ASCEND_BUILD_CACHE_DIR: ${{ env.BUILD_CACHE_DIR }}
-          VLLM_ASCEND_BUILD_CACHE_EVENT_LOG: ${{ env.CACHE_EVENT_LOG }}
+          VLLM_ASCEND_BUILD_CACHE_EVENT_LOG: /tmp/cold-${{ matrix.id }}.events.jsonl
         run: |
           set -euo pipefail
+          EVENT_LOG="$VLLM_ASCEND_BUILD_CACHE_EVENT_LOG"
+          BUILD_LOG="/tmp/cold-${{ matrix.id }}.build.log"
+
           rm -rf "$BUILD_CACHE_DIR" csrc/build build
-          rm -f "$CACHE_EVENT_LOG" "$CACHE_BUILD_LOG"
+          rm -f "$EVENT_LOG" "$BUILD_LOG"
           mkdir -p "$BUILD_CACHE_DIR"
-          touch "$CACHE_EVENT_LOG"
+          touch "$EVENT_LOG"
 
           set +u
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
-          source /usr/local/Ascend/nnal/atb/set_env.sh
+          if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then
+            source /usr/local/Ascend/nnal/atb/set_env.sh
+          fi
           set -u
           arch=$(uname -i)
           export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/Ascend/ascend-toolkit/latest/${arch}-linux/devlib"
 
-          cat >/tmp/watch-cache-events.py <<'PY'
-          import json
-          import sys
-          import time
-
-          # Keep normal CI output compact. Cache results and lock contention are
-          # printed immediately; phase details are printed only when a phase
-          # remains active long enough to look suspicious.
-          STALL_AFTER_SECONDS = 5.0
-          STALL_REPEAT_SECONDS = 10.0
-
-          actions = {}
-          phases = {}
-          last_stall_report = {}
-
-          def report_stalls():
-              now_ns = time.time_ns()
-              for pid, state in list(phases.items()):
-                  elapsed = (now_ns - state["started_ns"]) / 1e9
-                  if elapsed < STALL_AFTER_SECONDS:
-                      continue
-                  previous = last_stall_report.get(pid, 0.0)
-                  if elapsed - previous < STALL_REPEAT_SECONDS and previous:
-                      continue
-                  last_stall_report[pid] = elapsed
-                  unit, action = actions.get(pid, ("?", "?"))
-                  print(
-                      f"[cache] STALL pid={pid} {unit}/{action} "
-                      f"phase={state['phase']} elapsed={elapsed:.1f}s",
-                      flush=True,
-                  )
-
-          with open(sys.argv[1], "r", encoding="utf-8") as stream:
-              while True:
-                  line = stream.readline()
-                  if not line:
-                      report_stalls()
-                      time.sleep(0.1)
-                      continue
-
-                  try:
-                      event = json.loads(line)
-                  except json.JSONDecodeError:
-                      continue
-
-                  kind = event.get("event")
-                  pid = event.get("pid")
-                  if kind == "action_start":
-                      actions[pid] = (event.get("unit"), event.get("action"))
-                      print(
-                          f"[cache] START pid={pid} "
-                          f"{event.get('unit')}/{event.get('action')}",
-                          flush=True,
-                      )
-                  elif kind == "phase_start":
-                      phases[pid] = {
-                          "phase": event.get("phase"),
-                          "started_ns": event.get("timestamp_ns", time.time_ns()),
-                      }
-                      last_stall_report.pop(pid, None)
-                  elif kind == "phase_end":
-                      phases.pop(pid, None)
-                      last_stall_report.pop(pid, None)
-                  elif kind == "cache_result":
-                      print(
-                          f"[cache] {event.get('status')} "
-                          f"{event.get('unit')}/{event.get('action')}",
-                          flush=True,
-                      )
-                  elif kind in {
-                      "lock_wait",
-                      "lock_acquired",
-                      "lock_timeout",
-                      "index_skipped",
-                      "error",
-                  }:
-                      print(
-                          "[cache] " + json.dumps(event, sort_keys=True),
-                          flush=True,
-                      )
-
-                  report_stalls()
-          PY
-
-          python -u /tmp/watch-cache-events.py "$CACHE_EVENT_LOG" &
+          python -u /tmp/watch_cache_events.py "$EVENT_LOG" &
           watcher=$!
           trap 'kill "$watcher" 2>/dev/null || true' EXIT
 
+          echo "================ COLD BUILD START ================"
+          echo "target=${{ matrix.id }} SOC_VERSION=${SOC_VERSION}"
           start=$(date +%s)
           set +e
-          uv pip install -e . >"$CACHE_BUILD_LOG" 2>&1
+          uv pip install -e . >"$BUILD_LOG" 2>&1
           rc=$?
           set -e
           end=$(date +%s)
+          seconds=$((end-start))
+          echo "seconds=${seconds}" >> "$GITHUB_OUTPUT"
 
           kill "$watcher" 2>/dev/null || true
           wait "$watcher" 2>/dev/null || true
           trap - EXIT
 
-          build_seconds=$((end-start))
-          echo "build_seconds=${build_seconds}" >> "$GITHUB_OUTPUT"
-
+          echo "cold build exit_code=${rc} seconds=${seconds}"
           if [ "$rc" -ne 0 ]; then
-            echo "::error::Cold build failed with exit code ${rc}"
+            echo "::error::Cold build failed"
             echo "----- last build log lines -----"
-            tail -200 "$CACHE_BUILD_LOG" || true
+            tail -250 "$BUILD_LOG" || true
             echo "----- last cache events -----"
-            tail -100 "$CACHE_EVENT_LOG" || true
+            tail -150 "$EVENT_LOG" || true
             exit "$rc"
           fi
+          echo "==================================================="
 
-      - name: Record authoritative cache baseline
-        id: baseline
+      - name: Capture and print cold baseline
         run: |
           set -euo pipefail
-          python - <<'PY' >> "$GITHUB_OUTPUT"
-          import collections
-          import json
-          import os
-          from pathlib import Path
-          import subprocess
+          python /tmp/cache_ci_diag.py baseline \
+            --cache-root "$BUILD_CACHE_DIR" \
+            --output "$BASELINE_JSON" \
+            --target "${{ matrix.id }}" \
+            --soc "$SOC_VERSION"
 
-          root = Path(os.environ["BUILD_CACHE_DIR"])
-          manifests = []
-          for path in root.rglob("manifest.json"):
-              try:
-                  manifests.append(json.loads(path.read_text(encoding="utf-8")))
-              except Exception:
-                  pass
+          python /tmp/cache_ci_diag.py report \
+            --cache-root "$BUILD_CACHE_DIR" \
+            --baseline "$BASELINE_JSON" \
+            --events "/tmp/cold-${{ matrix.id }}.events.jsonl" \
+            --title "COLD EVENT SUMMARY"
 
-          op = [m for m in manifests if m.get("domain") == "custom_operator"]
-          tp = [m for m in manifests if m.get("domain") == "third_party"]
-
-          items = [p for p in root.rglob("*") if p.is_file() or p.is_symlink()]
-          payload_bytes = sum(p.lstat().st_size for p in items)
-
-          counts = collections.Counter(m.get("operator") for m in op if m.get("operator"))
-          tracked = subprocess.check_output(["git", "ls-files", "csrc"], text=True).splitlines()
-          suffixes = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
-
-          chosen_operator = None
-          chosen_file = None
-          chosen_actions = None
-          for operator, action_count in sorted(counts.items(), key=lambda item: (item[1], item[0])):
-              candidates = []
-              for raw in tracked:
-                  path = Path(raw)
-                  if path.suffix.lower() not in suffixes:
-                      continue
-                  if operator not in path.parts:
-                      continue
-                  if "build" in path.parts or "third_party" in path.parts:
-                      continue
-                  candidates.append(path)
-              if candidates:
-                  chosen_operator = operator
-                  chosen_actions = action_count
-                  chosen_file = sorted(candidates, key=lambda p: (len(p.parts), str(p)))[0]
-                  break
-
-          if not op:
-              raise SystemExit("cold build produced no custom-operator cache manifests")
-          if not tp:
-              raise SystemExit("cold build produced no third-party cache manifests")
-          if chosen_operator is None or chosen_file is None:
-              raise SystemExit("could not choose a source-backed operator for incremental validation")
-
-          print(f"operator_entries={len(op)}")
-          print(f"third_party_entries={len(tp)}")
-          print(f"payload_bytes={payload_bytes}")
-          print(f"payload_items={len(items)}")
-          print(f"changed_operator={chosen_operator}")
-          print(f"changed_operator_actions={chosen_actions}")
-          print(f"changed_source_file={chosen_file}")
-          PY
-
-          python - <<'PY'
-          import collections, json, os
-          from pathlib import Path
-          events = []
-          path = Path(os.environ["CACHE_EVENT_LOG"])
-          for line in path.read_text(encoding="utf-8").splitlines():
-              try:
-                  events.append(json.loads(line))
-              except json.JSONDecodeError:
-                  pass
-          counts = collections.Counter(
-              (e.get("domain"), e.get("status"))
-              for e in events if e.get("event") == "cache_result"
-          )
-          print("=== cold cache events ===")
-          for key, value in sorted(counts.items(), key=lambda x: str(x[0])):
-              print(f"{key}: {value}")
-          waits = [e for e in events if e.get("event") == "lock_wait"]
-          timeouts = [e for e in events if e.get("event") == "lock_timeout"]
-          print(f"lock_wait_events={len(waits)} lock_timeouts={len(timeouts)}")
-          PY
-
-      - name: Save persistent build cache to GitHub cache
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ env.BUILD_CACHE_DIR }}
-          key: ${{ steps.cache-key.outputs.cache_key }}
-
-      - name: Seed summary
-        run: |
-          {
-            echo "### Cold seed baseline"
-            echo "- source: \`${{ steps.source.outputs.source_sha }}\`"
-            echo "- cold build: ${{ steps.build.outputs.build_seconds }}s"
-            echo "- custom-operator entries: ${{ steps.baseline.outputs.operator_entries }}"
-            echo "- third-party entries: ${{ steps.baseline.outputs.third_party_entries }}"
-            echo "- cache payload: ${{ steps.baseline.outputs.payload_bytes }} bytes / ${{ steps.baseline.outputs.payload_items }} items"
-            echo "- incremental probe: \`${{ steps.baseline.outputs.changed_operator }}\` (${{ steps.baseline.outputs.changed_operator_actions }} actions)"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  cache-full-reuse:
-    name: Full fresh-runner reuse and speedup
-    needs: cache-seed-baseline
-    runs-on: linux-aarch64-a3-2
-    timeout-minutes: 60
-    container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
-
-    steps:
-      - name: Checkout exact seed source
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.cache-seed-baseline.outputs.source_sha }}
-          fetch-depth: 0
-          submodules: recursive
-
-      - name: Trust checkout for git introspection
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Install build dependencies
-        run: |
-          set -euo pipefail
-          sed -Ei 's@(ports|archive).ubuntu.com@cache-service.nginx-pypi-cache.svc.cluster.local:8081@g' /etc/apt/sources.list
-          pip config set global.index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple >/dev/null
-          pip config set global.trusted-host cache-service.nginx-pypi-cache.svc.cluster.local >/dev/null
-          {
-            apt-get update -qq
-            xargs apt-get -y -qq install < packages.txt
-            apt-get -y -qq install gcc g++ cmake libnuma-dev clang-15 git zstd
-          } >/tmp/system-deps.log 2>&1 || { tail -200 /tmp/system-deps.log; exit 1; }
-          update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20 >/dev/null
-          update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20 >/dev/null
-          python -m pip install -q uv uc-manager
-          {
-            uv pip install -r requirements-dev.txt
-            uv pip install --force-reinstall --no-deps triton-ascend==3.2.2
-          } >/tmp/python-deps.log 2>&1 || { tail -200 /tmp/python-deps.log; exit 1; }
-
-      - name: Restore seed cache
-        id: restore
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.BUILD_CACHE_DIR }}
-          key: ${{ needs.cache-seed-baseline.outputs.cache_key }}
-
-      - name: Verify restored snapshot
-        run: |
-          set -euo pipefail
-          [ "${{ steps.restore.outputs.cache-hit }}" = "true" ] || {
-            echo "::error::Exact GitHub cache restore missed."
-            exit 1
-          }
-
-          python - <<'PY'
-          import json, os
-          from pathlib import Path
-
-          root = Path(os.environ["BUILD_CACHE_DIR"])
-          manifests = [json.loads(p.read_text()) for p in root.rglob("manifest.json")]
-          op = sum(m.get("domain") == "custom_operator" for m in manifests)
-          tp = sum(m.get("domain") == "third_party" for m in manifests)
-          items = [p for p in root.rglob("*") if p.is_file() or p.is_symlink()]
-          payload = sum(p.lstat().st_size for p in items)
-
-          expected_op = int("${{ needs.cache-seed-baseline.outputs.operator_entries }}")
-          expected_tp = int("${{ needs.cache-seed-baseline.outputs.third_party_entries }}")
-          expected_payload = int("${{ needs.cache-seed-baseline.outputs.payload_bytes }}")
-          expected_items = int("${{ needs.cache-seed-baseline.outputs.payload_items }}")
-
-          print(f"restored operator_entries={op}")
-          print(f"restored third_party_entries={tp}")
-          print(f"restored payload_bytes={payload}")
-          print(f"restored payload_items={len(items)}")
-          assert op == expected_op
-          assert tp == expected_tp
-          assert payload == expected_payload
-          assert len(items) == expected_items
-          PY
-
-      - name: Fresh-tree full reuse build
+      - name: Same-runner fresh-tree full reuse
         id: reuse
         env:
           VLLM_ASCEND_BUILD_CACHE_DIR: ${{ env.BUILD_CACHE_DIR }}
-          VLLM_ASCEND_BUILD_CACHE_EVENT_LOG: ${{ env.CACHE_EVENT_LOG }}
+          VLLM_ASCEND_BUILD_CACHE_EVENT_LOG: /tmp/reuse-${{ matrix.id }}.events.jsonl
         run: |
           set -euo pipefail
+          EVENT_LOG="$VLLM_ASCEND_BUILD_CACHE_EVENT_LOG"
+          BUILD_LOG="/tmp/reuse-${{ matrix.id }}.build.log"
+
           rm -rf csrc/build build
-          rm -f "$CACHE_EVENT_LOG" "$CACHE_BUILD_LOG"
-          touch "$CACHE_EVENT_LOG"
+          rm -f "$EVENT_LOG" "$BUILD_LOG"
+          touch "$EVENT_LOG"
 
           set +u
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
-          source /usr/local/Ascend/nnal/atb/set_env.sh
+          if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then
+            source /usr/local/Ascend/nnal/atb/set_env.sh
+          fi
           set -u
           arch=$(uname -i)
           export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/Ascend/ascend-toolkit/latest/${arch}-linux/devlib"
 
-          cat >/tmp/watch-cache-events.py <<'PY'
-          import json
-          import sys
-          import time
-
-          # Keep normal CI output compact. Cache results and lock contention are
-          # printed immediately; phase details are printed only when a phase
-          # remains active long enough to look suspicious.
-          STALL_AFTER_SECONDS = 5.0
-          STALL_REPEAT_SECONDS = 10.0
-
-          actions = {}
-          phases = {}
-          last_stall_report = {}
-
-          def report_stalls():
-              now_ns = time.time_ns()
-              for pid, state in list(phases.items()):
-                  elapsed = (now_ns - state["started_ns"]) / 1e9
-                  if elapsed < STALL_AFTER_SECONDS:
-                      continue
-                  previous = last_stall_report.get(pid, 0.0)
-                  if elapsed - previous < STALL_REPEAT_SECONDS and previous:
-                      continue
-                  last_stall_report[pid] = elapsed
-                  unit, action = actions.get(pid, ("?", "?"))
-                  print(
-                      f"[cache] STALL pid={pid} {unit}/{action} "
-                      f"phase={state['phase']} elapsed={elapsed:.1f}s",
-                      flush=True,
-                  )
-
-          with open(sys.argv[1], "r", encoding="utf-8") as stream:
-              while True:
-                  line = stream.readline()
-                  if not line:
-                      report_stalls()
-                      time.sleep(0.1)
-                      continue
-
-                  try:
-                      event = json.loads(line)
-                  except json.JSONDecodeError:
-                      continue
-
-                  kind = event.get("event")
-                  pid = event.get("pid")
-                  if kind == "action_start":
-                      actions[pid] = (event.get("unit"), event.get("action"))
-                      print(
-                          f"[cache] START pid={pid} "
-                          f"{event.get('unit')}/{event.get('action')}",
-                          flush=True,
-                      )
-                  elif kind == "phase_start":
-                      phases[pid] = {
-                          "phase": event.get("phase"),
-                          "started_ns": event.get("timestamp_ns", time.time_ns()),
-                      }
-                      last_stall_report.pop(pid, None)
-                  elif kind == "phase_end":
-                      phases.pop(pid, None)
-                      last_stall_report.pop(pid, None)
-                  elif kind == "cache_result":
-                      print(
-                          f"[cache] {event.get('status')} "
-                          f"{event.get('unit')}/{event.get('action')}",
-                          flush=True,
-                      )
-                  elif kind in {
-                      "lock_wait",
-                      "lock_acquired",
-                      "lock_timeout",
-                      "index_skipped",
-                      "error",
-                  }:
-                      print(
-                          "[cache] " + json.dumps(event, sort_keys=True),
-                          flush=True,
-                      )
-
-                  report_stalls()
-          PY
-          python -u /tmp/watch-cache-events.py "$CACHE_EVENT_LOG" &
+          python -u /tmp/watch_cache_events.py "$EVENT_LOG" &
           watcher=$!
           trap 'kill "$watcher" 2>/dev/null || true' EXIT
 
+          echo "================ SAME-RUNNER REUSE START ================"
+          echo "target=${{ matrix.id }} SOC_VERSION=${SOC_VERSION}"
+          echo "persistent cache root=$BUILD_CACHE_DIR"
           start=$(date +%s)
           set +e
-          uv pip install -e . >"$CACHE_BUILD_LOG" 2>&1
+          uv pip install -e . >"$BUILD_LOG" 2>&1
           rc=$?
           set -e
           end=$(date +%s)
+          seconds=$((end-start))
+          echo "seconds=${seconds}" >> "$GITHUB_OUTPUT"
 
           kill "$watcher" 2>/dev/null || true
           wait "$watcher" 2>/dev/null || true
           trap - EXIT
-          seconds=$((end-start))
-          echo "build_seconds=${seconds}" >> "$GITHUB_OUTPUT"
 
+          echo "reuse build exit_code=${rc} seconds=${seconds}"
           if [ "$rc" -ne 0 ]; then
-            tail -200 "$CACHE_BUILD_LOG" || true
-            tail -100 "$CACHE_EVENT_LOG" || true
+            echo "::error::Reuse build failed"
+            tail -250 "$BUILD_LOG" || true
+            tail -150 "$EVENT_LOG" || true
             exit "$rc"
           fi
+          echo "========================================================="
 
-      - name: Validate complete reuse and speedup
+      - name: Validate and explain full reuse
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import collections, json, os
-          from pathlib import Path
-
-          events = [json.loads(x) for x in Path(os.environ["CACHE_EVENT_LOG"]).read_text().splitlines() if x.strip()]
-          results = [e for e in events if e.get("event") == "cache_result"]
-
-          op_hit = sum(e.get("domain") == "custom_operator" and e.get("status") == "HIT" for e in results)
-          op_miss = sum(e.get("domain") == "custom_operator" and e.get("status") == "MISS" for e in results)
-          tp_hit = sum(e.get("domain") == "third_party" and e.get("status") == "HIT" for e in results)
-          tp_miss = sum(e.get("domain") == "third_party" and e.get("status") == "MISS" for e in results)
-          timeouts = sum(e.get("event") == "lock_timeout" for e in events)
-
-          expected = int("${{ needs.cache-seed-baseline.outputs.operator_entries }}")
-          assert op_hit == expected, (op_hit, expected)
-          assert op_miss == 0, op_miss
-          assert tp_hit >= 1, tp_hit
-          assert tp_miss == 0, tp_miss
-          assert timeouts == 0, timeouts
-
-          cold = int("${{ needs.cache-seed-baseline.outputs.cold_seconds }}")
-          warm = int("${{ steps.reuse.outputs.build_seconds }}")
-          speedup = cold / max(warm, 1)
-          print(f"operator HIT={op_hit} MISS={op_miss}")
-          print(f"third_party HIT={tp_hit} MISS={tp_miss}")
-          print(f"cold={cold}s warm={warm}s speedup={speedup:.2f}x")
-          assert speedup >= 2.0, speedup
-          PY
+          python /tmp/cache_ci_diag.py validate-reuse \
+            --cache-root "$BUILD_CACHE_DIR" \
+            --baseline "$BASELINE_JSON" \
+            --events "/tmp/reuse-${{ matrix.id }}.events.jsonl" \
+            --cold-seconds "${{ steps.cold.outputs.seconds }}" \
+            --warm-seconds "${{ steps.reuse.outputs.seconds }}"
 
           test -d vllm_ascend/_cann_ops_custom
           find vllm_ascend -maxdepth 1 -name '*.so' -type f | grep -q .
 
-      - name: Full reuse summary
-        if: success()
-        run: |
-          {
-            echo "### Full fresh-runner reuse"
-            echo "- warm build: ${{ steps.reuse.outputs.build_seconds }}s"
-            echo "- cold baseline: ${{ needs.cache-seed-baseline.outputs.cold_seconds }}s"
-            echo "- expected operator HITs: ${{ needs.cache-seed-baseline.outputs.operator_entries }}"
-            echo "- operator MISS: 0"
-            echo "- fresh package/install: PASS"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  cache-partial-rebuild:
-    name: Incremental partial rebuild
-    needs: cache-seed-baseline
-    runs-on: linux-aarch64-310p-2
-    timeout-minutes: 60
-    container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
-
-    steps:
-      - name: Checkout exact seed source
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.cache-seed-baseline.outputs.source_sha }}
-          fetch-depth: 0
-          submodules: recursive
-
-      - name: Trust checkout for git introspection
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Install build dependencies
+      - name: Choose and mutate device-specific incremental probe
         run: |
           set -euo pipefail
-          sed -Ei 's@(ports|archive).ubuntu.com@cache-service.nginx-pypi-cache.svc.cluster.local:8081@g' /etc/apt/sources.list
-          pip config set global.index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple >/dev/null
-          pip config set global.trusted-host cache-service.nginx-pypi-cache.svc.cluster.local >/dev/null
-          {
-            apt-get update -qq
-            xargs apt-get -y -qq install < packages.txt
-            apt-get -y -qq install gcc g++ cmake libnuma-dev clang-15 git zstd
-          } >/tmp/system-deps.log 2>&1 || { tail -200 /tmp/system-deps.log; exit 1; }
-          update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20 >/dev/null
-          update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20 >/dev/null
-          python -m pip install -q uv uc-manager
-          {
-            uv pip install -r requirements-dev.txt
-            uv pip install --force-reinstall --no-deps triton-ascend==3.2.2
-          } >/tmp/python-deps.log 2>&1 || { tail -200 /tmp/python-deps.log; exit 1; }
+          python /tmp/cache_ci_diag.py choose-probe \
+            --baseline "$BASELINE_JSON" \
+            --output "$PROBE_JSON"
 
-      - name: Restore seed cache
-        id: restore
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.BUILD_CACHE_DIR }}
-          key: ${{ needs.cache-seed-baseline.outputs.cache_key }}
+          source_file=$(python -c 'import json,os; print(json.load(open(os.environ["PROBE_JSON"]))["source_file"])')
+          operator=$(python -c 'import json,os; print(json.load(open(os.environ["PROBE_JSON"]))["operator"])')
+          expected_actions=$(python -c 'import json,os; print(json.load(open(os.environ["PROBE_JSON"]))["expected_actions"])')
 
-      - name: Mutate exactly one operator source
-        run: |
-          set -euo pipefail
-          [ "${{ steps.restore.outputs.cache-hit }}" = "true" ] || exit 1
-
-          source_file='${{ needs.cache-seed-baseline.outputs.changed_source_file }}'
-          operator='${{ needs.cache-seed-baseline.outputs.changed_operator }}'
-
-          test -f "$source_file"
-          printf '\n// incremental-cache-validation: %s\n' "$GITHUB_RUN_ID" >> "$source_file"
-
-          echo "Incremental probe:"
-          echo "  operator=${operator}"
-          echo "  expected affected actions=${{ needs.cache-seed-baseline.outputs.changed_operator_actions }}"
-          echo "  source=${source_file}"
+          echo "Mutating one source file for this device-specific operator:"
+          echo "  operator=$operator"
+          echo "  expected_actions=$expected_actions"
+          echo "  source_file=$source_file"
+          printf '\n// incremental-cache-validation: %s-%s\n' \
+            "${{ matrix.id }}" "$GITHUB_RUN_ID" >> "$source_file"
           git diff --stat -- "$source_file"
 
-      - name: Fresh-tree incremental build
+      - name: Same-runner partial incremental rebuild
         id: incremental
         env:
           VLLM_ASCEND_BUILD_CACHE_DIR: ${{ env.BUILD_CACHE_DIR }}
-          VLLM_ASCEND_BUILD_CACHE_EVENT_LOG: ${{ env.CACHE_EVENT_LOG }}
+          VLLM_ASCEND_BUILD_CACHE_EVENT_LOG: /tmp/incremental-${{ matrix.id }}.events.jsonl
         run: |
           set -euo pipefail
+          EVENT_LOG="$VLLM_ASCEND_BUILD_CACHE_EVENT_LOG"
+          BUILD_LOG="/tmp/incremental-${{ matrix.id }}.build.log"
+
           rm -rf csrc/build build
-          rm -f "$CACHE_EVENT_LOG" "$CACHE_BUILD_LOG"
-          touch "$CACHE_EVENT_LOG"
+          rm -f "$EVENT_LOG" "$BUILD_LOG"
+          touch "$EVENT_LOG"
 
           set +u
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
-          source /usr/local/Ascend/nnal/atb/set_env.sh
+          if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then
+            source /usr/local/Ascend/nnal/atb/set_env.sh
+          fi
           set -u
           arch=$(uname -i)
           export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/Ascend/ascend-toolkit/latest/${arch}-linux/devlib"
 
-          cat >/tmp/watch-cache-events.py <<'PY'
-          import json
-          import sys
-          import time
-
-          # Keep normal CI output compact. Cache results and lock contention are
-          # printed immediately; phase details are printed only when a phase
-          # remains active long enough to look suspicious.
-          STALL_AFTER_SECONDS = 5.0
-          STALL_REPEAT_SECONDS = 10.0
-
-          actions = {}
-          phases = {}
-          last_stall_report = {}
-
-          def report_stalls():
-              now_ns = time.time_ns()
-              for pid, state in list(phases.items()):
-                  elapsed = (now_ns - state["started_ns"]) / 1e9
-                  if elapsed < STALL_AFTER_SECONDS:
-                      continue
-                  previous = last_stall_report.get(pid, 0.0)
-                  if elapsed - previous < STALL_REPEAT_SECONDS and previous:
-                      continue
-                  last_stall_report[pid] = elapsed
-                  unit, action = actions.get(pid, ("?", "?"))
-                  print(
-                      f"[cache] STALL pid={pid} {unit}/{action} "
-                      f"phase={state['phase']} elapsed={elapsed:.1f}s",
-                      flush=True,
-                  )
-
-          with open(sys.argv[1], "r", encoding="utf-8") as stream:
-              while True:
-                  line = stream.readline()
-                  if not line:
-                      report_stalls()
-                      time.sleep(0.1)
-                      continue
-
-                  try:
-                      event = json.loads(line)
-                  except json.JSONDecodeError:
-                      continue
-
-                  kind = event.get("event")
-                  pid = event.get("pid")
-                  if kind == "action_start":
-                      actions[pid] = (event.get("unit"), event.get("action"))
-                      print(
-                          f"[cache] START pid={pid} "
-                          f"{event.get('unit')}/{event.get('action')}",
-                          flush=True,
-                      )
-                  elif kind == "phase_start":
-                      phases[pid] = {
-                          "phase": event.get("phase"),
-                          "started_ns": event.get("timestamp_ns", time.time_ns()),
-                      }
-                      last_stall_report.pop(pid, None)
-                  elif kind == "phase_end":
-                      phases.pop(pid, None)
-                      last_stall_report.pop(pid, None)
-                  elif kind == "cache_result":
-                      print(
-                          f"[cache] {event.get('status')} "
-                          f"{event.get('unit')}/{event.get('action')}",
-                          flush=True,
-                      )
-                  elif kind in {
-                      "lock_wait",
-                      "lock_acquired",
-                      "lock_timeout",
-                      "index_skipped",
-                      "error",
-                  }:
-                      print(
-                          "[cache] " + json.dumps(event, sort_keys=True),
-                          flush=True,
-                      )
-
-                  report_stalls()
-          PY
-          python -u /tmp/watch-cache-events.py "$CACHE_EVENT_LOG" &
+          python -u /tmp/watch_cache_events.py "$EVENT_LOG" &
           watcher=$!
           trap 'kill "$watcher" 2>/dev/null || true' EXIT
 
+          echo "================ PARTIAL REBUILD START ================"
+          echo "target=${{ matrix.id }} SOC_VERSION=${SOC_VERSION}"
           start=$(date +%s)
           set +e
-          uv pip install -e . >"$CACHE_BUILD_LOG" 2>&1
+          uv pip install -e . >"$BUILD_LOG" 2>&1
           rc=$?
           set -e
           end=$(date +%s)
+          seconds=$((end-start))
+          echo "seconds=${seconds}" >> "$GITHUB_OUTPUT"
 
           kill "$watcher" 2>/dev/null || true
           wait "$watcher" 2>/dev/null || true
           trap - EXIT
-          echo "build_seconds=$((end-start))" >> "$GITHUB_OUTPUT"
 
+          echo "incremental build exit_code=${rc} seconds=${seconds}"
           if [ "$rc" -ne 0 ]; then
-            tail -200 "$CACHE_BUILD_LOG" || true
-            tail -100 "$CACHE_EVENT_LOG" || true
+            echo "::error::Incremental build failed"
+            tail -250 "$BUILD_LOG" || true
+            tail -150 "$EVENT_LOG" || true
             exit "$rc"
           fi
+          echo "======================================================="
 
-      - name: Validate exact partial invalidation
+      - name: Validate and explain partial rebuild
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import json, os
-          from pathlib import Path
-
-          events = [json.loads(x) for x in Path(os.environ["CACHE_EVENT_LOG"]).read_text().splitlines() if x.strip()]
-          results = [e for e in events if e.get("event") == "cache_result"]
-
-          changed = "${{ needs.cache-seed-baseline.outputs.changed_operator }}"
-          expected_changed = int("${{ needs.cache-seed-baseline.outputs.changed_operator_actions }}")
-          total = int("${{ needs.cache-seed-baseline.outputs.operator_entries }}")
-
-          op_hits = [e for e in results if e.get("domain") == "custom_operator" and e.get("status") == "HIT"]
-          op_misses = [e for e in results if e.get("domain") == "custom_operator" and e.get("status") == "MISS"]
-          op_saved = [e for e in results if e.get("domain") == "custom_operator" and e.get("status") == "SAVED"]
-          tp_hit = sum(e.get("domain") == "third_party" and e.get("status") == "HIT" for e in results)
-          tp_miss = sum(e.get("domain") == "third_party" and e.get("status") == "MISS" for e in results)
-          timeouts = sum(e.get("event") == "lock_timeout" for e in events)
-
-          changed_misses = [e for e in op_misses if e.get("unit") == changed]
-          foreign_misses = [e for e in op_misses if e.get("unit") != changed]
-          changed_saved = [e for e in op_saved if e.get("unit") == changed]
-
-          print(f"changed operator={changed}")
-          print(f"custom_operator HIT={len(op_hits)} MISS={len(op_misses)} SAVED={len(op_saved)}")
-          print(f"changed MISS={len(changed_misses)} expected={expected_changed}")
-          print(f"foreign MISS={len(foreign_misses)}")
-          print(f"third_party HIT={tp_hit} MISS={tp_miss}")
-
-          assert len(changed_misses) == expected_changed
-          assert len(changed_saved) == expected_changed
-          assert not foreign_misses, foreign_misses
-          assert len(op_hits) == total - expected_changed
-          assert tp_hit >= 1
-          assert tp_miss == 0
-          assert timeouts == 0
-          PY
+          python /tmp/cache_ci_diag.py validate-incremental \
+            --cache-root "$BUILD_CACHE_DIR" \
+            --baseline "$BASELINE_JSON" \
+            --probe "$PROBE_JSON" \
+            --events "/tmp/incremental-${{ matrix.id }}.events.jsonl"
 
           test -d vllm_ascend/_cann_ops_custom
           find vllm_ascend -maxdepth 1 -name '*.so' -type f | grep -q .
 
-      - name: Incremental rebuild summary
-        if: success()
+      - name: Final device summary
+        if: always()
         run: |
-          {
-            echo "### Partial rebuild"
-            echo "- changed operator: \`${{ needs.cache-seed-baseline.outputs.changed_operator }}\`"
-            echo "- expected MISS/SAVED actions: ${{ needs.cache-seed-baseline.outputs.changed_operator_actions }}"
-            echo "- total cached actions: ${{ needs.cache-seed-baseline.outputs.operator_entries }}"
-            echo "- build time: ${{ steps.incremental.outputs.build_seconds }}s"
-            echo "- unrelated operator MISS: 0"
-            echo "- final package/install: PASS"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "================ FINAL DEVICE SUMMARY ================"
+          echo "target=${{ matrix.id }}"
+          echo "runner=${{ matrix.runner }}"
+          echo "image=${{ matrix.image }}"
+          echo "SOC_VERSION=${SOC_VERSION}"
+          echo "cold_seconds=${{ steps.cold.outputs.seconds }}"
+          echo "reuse_seconds=${{ steps.reuse.outputs.seconds }}"
+          echo "incremental_seconds=${{ steps.incremental.outputs.seconds }}"
+          echo "No GitHub Actions cache transport was used."
+          echo "Cold/reuse/incremental all ran in the same job/runner/container."
+          echo "======================================================="
