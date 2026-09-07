@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -334,6 +335,105 @@ def test_prepared_input_change_invalidates_and_revert_hits_history(tmp_path: Pat
     assert "[build-cache] HIT" in reverted.stdout
     assert _extract_key(reverted) == key_original
     assert counter.read_text() == "2"
+
+
+def test_recipe_normalizes_ephemeral_cmake_path_without_hiding_semantic_changes(
+    tmp_path: Path,
+):
+    spec = importlib.util.spec_from_file_location(
+        "build_cache_engine_recipe_path_test",
+        ENGINE,
+    )
+    assert spec is not None and spec.loader is not None
+    engine = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(engine)
+
+    source = tmp_path / "source"
+    source.mkdir()
+    binary_a = tmp_path / "build-a"
+    binary_b = tmp_path / "build-b"
+    binary_a.mkdir()
+    binary_b.mkdir()
+
+    tool_a = tmp_path / "pep517-a" / "bin" / "cmake"
+    tool_b = tmp_path / "pep517-b" / "bin" / "cmake"
+
+    def write_fake_cmake(path: Path, version: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "#!/bin/sh\n"
+            f'echo "cmake version {version}"\n',
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+
+    write_fake_cmake(tool_a, "4.4.3")
+    write_fake_cmake(tool_b, "4.4.3")
+
+    env_hash_a, _ = engine._hash_compiler_environment(
+        "host-cxx",
+        [],
+        [],
+        [str(tool_a)],
+    )
+    env_hash_b, _ = engine._hash_compiler_environment(
+        "host-cxx",
+        [],
+        [],
+        [str(tool_b)],
+    )
+    assert env_hash_a == env_hash_b
+
+    recipe_values = ["protobuf_BUILD_TESTS=OFF"]
+    command_a = [str(tool_a), "--build", "."]
+    command_b = [str(tool_b), "--build", "."]
+
+    raw_hash_a, _ = engine._hash_recipe(
+        [],
+        recipe_values,
+        command_a,
+        [source, binary_a],
+    )
+    raw_hash_b, _ = engine._hash_recipe(
+        [],
+        recipe_values,
+        command_b,
+        [source, binary_b],
+    )
+    assert raw_hash_a != raw_hash_b
+
+    stable_hash_a, manifest_a = engine._hash_recipe(
+        [],
+        recipe_values,
+        command_a,
+        [source, binary_a, tool_a],
+    )
+    stable_hash_b, manifest_b = engine._hash_recipe(
+        [],
+        recipe_values,
+        command_b,
+        [source, binary_b, tool_b],
+    )
+    assert stable_hash_a == stable_hash_b
+    assert manifest_a[-1]["argv"] == ["<PATH_2>", "--build", "."]
+    assert manifest_b[-1]["argv"] == ["<PATH_2>", "--build", "."]
+
+    write_fake_cmake(tool_b, "4.4.4")
+    changed_env_hash, _ = engine._hash_compiler_environment(
+        "host-cxx",
+        [],
+        [],
+        [str(tool_b)],
+    )
+    assert changed_env_hash != env_hash_a
+
+    changed_recipe_hash, _ = engine._hash_recipe(
+        [],
+        ["protobuf_BUILD_TESTS=ON"],
+        command_b,
+        [source, binary_b, tool_b],
+    )
+    assert changed_recipe_hash != stable_hash_a
 
 
 def test_recipe_change_invalidates_cache(tmp_path: Path):

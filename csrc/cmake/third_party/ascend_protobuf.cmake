@@ -71,6 +71,11 @@ else()
         RECIPE_VALUE ${_protobuf_build_recipe}
         ENVIRONMENT_PROFILE host-cxx
         ENVIRONMENT_TOOL ${CMAKE_C_COMPILER} ${CMAKE_CXX_COMPILER} ${CMAKE_COMMAND}
+        # CMAKE_COMMAND is a full executable path. PEP 517/uv may recreate the
+        # same CMake version under a different temporary build-environment path
+        # for each editable build. Its semantic identity is already captured by
+        # compiler_environment_hash, so keep the physical path out of recipe_hash.
+        NORMALIZE_PATH ${CMAKE_COMMAND}
         ARTIFACT_INCLUDE "protoc" "*.a"
         COMMAND ${CMAKE_COMMAND} --build .
     )
