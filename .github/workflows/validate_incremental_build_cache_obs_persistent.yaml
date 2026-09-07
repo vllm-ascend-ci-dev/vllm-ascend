@@ -1,0 +1,593 @@
+name: Validate persistent incremental build cache on OBS
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Source ref containing the incremental build-cache implementation
+        required: true
+        default: feat/local-incremental-build-cache
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash -el {0}
+
+env:
+  # Huawei OBS through the RunsOn S3-compatible cache backend.
+  RUNS_ON_S3_BUCKET_CACHE: obs-guiiyang1-ascend-test
+  RUNS_ON_S3_BUCKET_ENDPOINT: https://obs.cn-southwest-2.myhuaweicloud.com
+  RUNS_ON_S3_FORCE_PATH_STYLE: "false"
+  AWS_S3_FORCE_PATH_STYLE: "false"
+  AWS_REGION: cn-southwest-2
+
+  UV_INDEX_URL: http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+  UV_EXTRA_INDEX_URL: "https://repo.huaweicloud.com/ascend/repos/pypi http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+  UV_INDEX_STRATEGY: unsafe-best-match
+  UV_INSECURE_HOST: cache-service.nginx-pypi-cache.svc.cluster.local
+  UV_HTTP_TIMEOUT: "120"
+  UV_NO_CACHE: "1"
+  UV_SYSTEM_PYTHON: "1"
+
+  SOC_VERSION: ascend910b1
+  COMPILE_CUSTOM_KERNELS: "1"
+  MAX_JOBS: "16"
+
+  VLLM_ASCEND_BUILD_CACHE_ENTRY_LOCK_TIMEOUT_SECONDS: "60"
+  VLLM_ASCEND_BUILD_CACHE_ACTION_LOCK_TIMEOUT_SECONDS: "120"
+  VLLM_ASCEND_BUILD_CACHE_PUBLISH_LOCK_TIMEOUT_SECONDS: "120"
+
+  BUILD_CACHE_DIR: /tmp/vllm-ascend-incremental-build-cache
+
+  # Outer OBS transport compatibility envelope.
+  #
+  # Do not add source SHA / branch / recipe hash / compiler hash here. Those
+  # are already represented by the inner content-addressed build-cache keys.
+  # Bump this epoch only when the persistent on-disk format or transport
+  # semantics become intentionally incompatible.
+  CACHE_NAMESPACE: vllm-ascend-inc-obs
+  CACHE_TRANSPORT_EPOCH: v1
+  CACHE_COMPAT: linux-aarch64-ascend910b1-cann9.1.0-ubuntu22.04-py3.12
+
+jobs:
+  restore-build-save:
+    name: Restore latest compatible cache, build, and save OBS snapshot
+    timeout-minutes: 90
+    runs-on: linux-aarch64-a2-2
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
+
+    outputs:
+      source_sha: ${{ steps.keys.outputs.source_sha }}
+      primary_key: ${{ steps.keys.outputs.primary_key }}
+      compat_prefix: ${{ steps.keys.outputs.compat_prefix }}
+      same_source_prefix: ${{ steps.keys.outputs.same_source_prefix }}
+      expected_op: ${{ steps.build.outputs.expected_op }}
+      expected_tp: ${{ steps.build.outputs.expected_tp }}
+      build_seconds: ${{ steps.build.outputs.build_seconds }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Trust checkout
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build OBS cache keys
+        id: keys
+        run: |
+          set -euo pipefail
+
+          source_sha="$(git rev-parse HEAD)"
+          engine_schema="$(python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          tree = ast.parse(Path("csrc/scripts/build_cache.py").read_text(encoding="utf-8"))
+          for node in tree.body:
+              if isinstance(node, ast.Assign):
+                  for target in node.targets:
+                      if isinstance(target, ast.Name) and target.id == "SCHEMA_VERSION":
+                          print(ast.literal_eval(node.value))
+                          raise SystemExit(0)
+          raise SystemExit("SCHEMA_VERSION not found")
+          PY
+          )"
+          compat_prefix="${CACHE_NAMESPACE}-${CACHE_TRANSPORT_EPOCH}-schema${engine_schema}-${CACHE_COMPAT}-"
+          same_source_prefix="${compat_prefix}${source_sha}-"
+
+          # Cache archives are immutable. Every successful run publishes a new
+          # snapshot. restore-keys select the newest prior compatible snapshot.
+          primary_key="${same_source_prefix}${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          {
+            echo "source_sha=${source_sha}"
+            echo "compat_prefix=${compat_prefix}"
+            echo "same_source_prefix=${same_source_prefix}"
+            echo "primary_key=${primary_key}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "================ OBS CACHE KEY ================"
+          echo "source_sha=${source_sha}"
+          echo "engine_schema=${engine_schema}"
+          echo "primary_key=${primary_key}"
+          echo "restore priority:"
+          echo "  1. ${same_source_prefix}*"
+          echo "  2. ${compat_prefix}*"
+          echo "================================================"
+
+      - name: Prepare empty transport destination
+        run: |
+          set -euo pipefail
+          rm -rf "$BUILD_CACHE_DIR" csrc/build build
+
+      - name: Restore previous OBS snapshot
+        id: restore
+        uses: runs-on/cache/restore@v5
+        with:
+          path: ${{ env.BUILD_CACHE_DIR }}
+          key: ${{ steps.keys.outputs.primary_key }}
+          restore-keys: |
+            ${{ steps.keys.outputs.same_source_prefix }}
+            ${{ steps.keys.outputs.compat_prefix }}
+
+      - name: Inspect restored snapshot
+        id: restore-state
+        env:
+          CURRENT_SOURCE_SHA: ${{ steps.keys.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+
+          manifests=0
+          if [ -d "$BUILD_CACHE_DIR" ]; then
+            manifests="$(find "$BUILD_CACHE_DIR" -type f -name manifest.json 2>/dev/null | wc -l | tr -d ' ')"
+          fi
+
+          previous_source=""
+          previous_key=""
+          metadata="$BUILD_CACHE_DIR/.transport/metadata.json"
+          if [ -s "$metadata" ]; then
+            previous_source="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_sha"])' "$metadata")"
+            previous_key="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["primary_key"])' "$metadata")"
+          fi
+
+          same_source="false"
+          if [ -n "$previous_source" ] && [ "$previous_source" = "$CURRENT_SOURCE_SHA" ]; then
+            same_source="true"
+          fi
+
+          {
+            echo "same_source=${same_source}"
+            echo "previous_source=${previous_source}"
+            echo "previous_key=${previous_key}"
+            echo "restored_manifests=${manifests}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "================ OBS RESTORE ================"
+          echo "cache-hit(exact unique key)=${{ steps.restore.outputs.cache-hit }}"
+          echo "cache-matched-key=${{ steps.restore.outputs.cache-matched-key }}"
+          echo "snapshot source=${previous_source:-<none>}"
+          echo "snapshot key=${previous_key:-<none>}"
+          echo "same-source snapshot=${same_source}"
+          echo "restored manifests=${manifests}"
+          echo "============================================="
+
+          # No restored cache is valid on the first run; the build will seed it.
+
+      - name: Prepare build environment
+        run: |
+          set -euo pipefail
+
+          sed -Ei 's@(ports|archive).ubuntu.com@cache-service.nginx-pypi-cache.svc.cluster.local:8081@g' /etc/apt/sources.list
+          pip config set global.index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple >/dev/null
+          pip config set global.trusted-host cache-service.nginx-pypi-cache.svc.cluster.local >/dev/null
+
+          {
+            apt-get update -qq
+            xargs apt-get -y -qq install < packages.txt
+            apt-get -y -qq install gcc g++ cmake libnuma-dev clang-15 git zstd
+          } >/tmp/system-deps.log 2>&1 || {
+            echo "::error::System dependency installation failed"
+            tail -200 /tmp/system-deps.log
+            exit 1
+          }
+
+          update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20 >/dev/null
+          update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20 >/dev/null
+
+          python -m pip install -q uv uc-manager
+          {
+            uv pip install -r requirements-dev.txt
+            uv pip install --force-reinstall --no-deps triton-ascend==3.2.2
+          } >/tmp/python-deps.log 2>&1 || {
+            echo "::error::Python dependency installation failed"
+            tail -200 /tmp/python-deps.log
+            exit 1
+          }
+
+      - name: Build using restored persistent cache
+        id: build
+        env:
+          VLLM_ASCEND_BUILD_CACHE_DIR: ${{ env.BUILD_CACHE_DIR }}
+          VLLM_ASCEND_BUILD_CACHE_EVENT_LOG: /tmp/obs-build.events.jsonl
+          SAME_SOURCE_RESTORE: ${{ steps.restore-state.outputs.same_source }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$BUILD_CACHE_DIR"
+          rm -rf csrc/build build
+          rm -f "$VLLM_ASCEND_BUILD_CACHE_EVENT_LOG" /tmp/obs-build.log
+          touch "$VLLM_ASCEND_BUILD_CACHE_EVENT_LOG"
+
+          set +u
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then
+            source /usr/local/Ascend/nnal/atb/set_env.sh
+          fi
+          set -u
+
+          arch="$(uname -i)"
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/Ascend/ascend-toolkit/latest/${arch}-linux/devlib"
+
+          start="$(date +%s)"
+          set +e
+          uv pip install -v -e . >/tmp/obs-build.log 2>&1
+          rc=$?
+          set -e
+          end="$(date +%s)"
+          seconds=$((end-start))
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Build failed"
+            tail -250 /tmp/obs-build.log || true
+            tail -150 "$VLLM_ASCEND_BUILD_CACHE_EVENT_LOG" || true
+            exit "$rc"
+          fi
+
+          python - "$VLLM_ASCEND_BUILD_CACHE_EVENT_LOG" "$GITHUB_OUTPUT" <<'PY'
+          import collections
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          event_path = Path(sys.argv[1])
+          output_path = Path(sys.argv[2])
+          events = [
+              json.loads(line)
+              for line in event_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          ]
+
+          starts = collections.Counter(
+              e.get("domain") for e in events if e.get("event") == "action_start"
+          )
+          results = collections.Counter(
+              (e.get("domain"), e.get("status"))
+              for e in events
+              if e.get("event") == "cache_result"
+          )
+
+          expected_op = starts["custom_operator"]
+          expected_tp = starts["third_party"]
+          op_hit = results[("custom_operator", "HIT")]
+          op_miss = results[("custom_operator", "MISS")]
+          op_bypass = results[("custom_operator", "BYPASS")]
+          tp_hit = results[("third_party", "HIT")]
+          tp_miss = results[("third_party", "MISS")]
+          tp_bypass = results[("third_party", "BYPASS")]
+          lock_timeouts = sum(e.get("event") == "lock_timeout" for e in events)
+          index_skipped = sum(e.get("event") == "index_skipped" for e in events)
+
+          print("================ BUILD CACHE RESULTS ================")
+          print(f"custom_operator actions={expected_op} HIT={op_hit} MISS={op_miss} BYPASS={op_bypass}")
+          print(f"third_party actions={expected_tp} HIT={tp_hit} MISS={tp_miss} BYPASS={tp_bypass}")
+          print(f"lock_timeout={lock_timeouts}")
+          print(f"index_skipped={index_skipped}")
+          print("=====================================================")
+
+          with output_path.open("a", encoding="utf-8") as stream:
+              stream.write(f"expected_op={expected_op}\n")
+              stream.write(f"expected_tp={expected_tp}\n")
+              stream.write(f"op_hit={op_hit}\n")
+              stream.write(f"op_miss={op_miss}\n")
+              stream.write(f"tp_hit={tp_hit}\n")
+              stream.write(f"tp_miss={tp_miss}\n")
+
+          failures = []
+          if expected_op <= 0:
+              failures.append("no custom_operator actions were observed")
+          if lock_timeouts:
+              failures.append(f"lock_timeout events={lock_timeouts}")
+          if os.environ.get("SAME_SOURCE_RESTORE") == "true":
+              if op_miss or op_bypass:
+                  failures.append(
+                      f"same-source restore custom_operator MISS={op_miss} BYPASS={op_bypass}"
+                  )
+              if tp_miss or tp_bypass:
+                  failures.append(
+                      f"same-source restore third_party MISS={tp_miss} BYPASS={tp_bypass}"
+                  )
+
+          if failures:
+              for failure in failures:
+                  print("ERROR:", failure)
+              raise SystemExit(1)
+          PY
+
+          echo "build_seconds=${seconds}" >> "$GITHUB_OUTPUT"
+
+          test -d vllm_ascend/_cann_ops_custom
+          find vllm_ascend -maxdepth 1 -name '*.so' -type f | grep -q .
+          du -sh "$BUILD_CACHE_DIR"
+
+      - name: Write OBS snapshot metadata
+        env:
+          SOURCE_SHA: ${{ steps.keys.outputs.source_sha }}
+          PRIMARY_KEY: ${{ steps.keys.outputs.primary_key }}
+          COMPAT_PREFIX: ${{ steps.keys.outputs.compat_prefix }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$BUILD_CACHE_DIR/.transport"
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          payload = {
+              "schema": 1,
+              "source_sha": os.environ["SOURCE_SHA"],
+              "primary_key": os.environ["PRIMARY_KEY"],
+              "compat_prefix": os.environ["COMPAT_PREFIX"],
+              "created_at": datetime.now(timezone.utc).isoformat(),
+          }
+          path = Path(os.environ["BUILD_CACHE_DIR"]) / ".transport" / "metadata.json"
+          path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(path.read_text(encoding="utf-8"))
+          PY
+
+      - name: Save updated incremental cache to OBS
+        uses: runs-on/cache/save@v5
+        env:
+          RUNS_ON_RUNNER_NAME: ""
+          AWS_ACCESS_KEY_ID: ${{ secrets.OBS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_KEY }}
+        with:
+          path: ${{ env.BUILD_CACHE_DIR }}
+          key: ${{ steps.keys.outputs.primary_key }}
+
+      - name: Producer summary
+        run: |
+          {
+            echo "## OBS persistent incremental cache"
+            echo "- source: \`${{ steps.keys.outputs.source_sha }}\`"
+            echo "- saved key: \`${{ steps.keys.outputs.primary_key }}\`"
+            echo "- previous snapshot key: \`${{ steps.restore-state.outputs.previous_key }}\`"
+            echo "- same-source restore: **${{ steps.restore-state.outputs.same_source }}**"
+            echo "- build: ${{ steps.build.outputs.build_seconds }}s"
+            echo "- custom operator: HIT=${{ steps.build.outputs.op_hit }}, MISS=${{ steps.build.outputs.op_miss }}"
+            echo "- third-party: HIT=${{ steps.build.outputs.tp_hit }}, MISS=${{ steps.build.outputs.tp_miss }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  verify-fresh-runner:
+    name: Exact OBS restore on fresh runner must fully reuse
+    needs: restore-build-save
+    timeout-minutes: 60
+    runs-on: linux-aarch64-a2-2
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
+
+    steps:
+      - name: Checkout exact source used by producer
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.restore-build-save.outputs.source_sha }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Trust checkout
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Prepare build environment
+        run: |
+          set -euo pipefail
+
+          sed -Ei 's@(ports|archive).ubuntu.com@cache-service.nginx-pypi-cache.svc.cluster.local:8081@g' /etc/apt/sources.list
+          pip config set global.index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple >/dev/null
+          pip config set global.trusted-host cache-service.nginx-pypi-cache.svc.cluster.local >/dev/null
+
+          {
+            apt-get update -qq
+            xargs apt-get -y -qq install < packages.txt
+            apt-get -y -qq install gcc g++ cmake libnuma-dev clang-15 git zstd
+          } >/tmp/system-deps.log 2>&1 || {
+            echo "::error::System dependency installation failed"
+            tail -200 /tmp/system-deps.log
+            exit 1
+          }
+
+          update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20 >/dev/null
+          update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20 >/dev/null
+
+          python -m pip install -q uv uc-manager
+          {
+            uv pip install -r requirements-dev.txt
+            uv pip install --force-reinstall --no-deps triton-ascend==3.2.2
+          } >/tmp/python-deps.log 2>&1 || {
+            echo "::error::Python dependency installation failed"
+            tail -200 /tmp/python-deps.log
+            exit 1
+          }
+
+      - name: Prepare empty cache destination
+        run: |
+          set -euo pipefail
+          rm -rf "$BUILD_CACHE_DIR" csrc/build build
+
+      - name: Restore exact snapshot written by producer
+        id: restore
+        uses: runs-on/cache/restore@v5
+        with:
+          path: ${{ env.BUILD_CACHE_DIR }}
+          key: ${{ needs.restore-build-save.outputs.primary_key }}
+
+      - name: Verify exact OBS transport
+        env:
+          EXPECTED_KEY: ${{ needs.restore-build-save.outputs.primary_key }}
+          EXPECTED_SOURCE: ${{ needs.restore-build-save.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+
+          echo "cache-hit=${{ steps.restore.outputs.cache-hit }}"
+          echo "cache-matched-key=${{ steps.restore.outputs.cache-matched-key }}"
+
+          if [ "${{ steps.restore.outputs.cache-hit }}" != "true" ]; then
+            echo "::error::Fresh runner did not restore the exact OBS snapshot."
+            exit 1
+          fi
+
+          metadata="$BUILD_CACHE_DIR/.transport/metadata.json"
+          test -s "$metadata"
+          python - "$metadata" <<'PY'
+          import json
+          import os
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert payload["primary_key"] == os.environ["EXPECTED_KEY"], payload
+          assert payload["source_sha"] == os.environ["EXPECTED_SOURCE"], payload
+          print(json.dumps(payload, indent=2, sort_keys=True))
+          PY
+
+          manifest_count="$(find "$BUILD_CACHE_DIR" -type f -name manifest.json | wc -l | tr -d ' ')"
+          echo "restored manifests=${manifest_count}"
+          if [ "$manifest_count" -le 0 ]; then
+            echo "::error::Exact OBS restore contained no build-cache manifests."
+            exit 1
+          fi
+          du -sh "$BUILD_CACHE_DIR"
+
+      - name: Fresh-tree build must fully HIT restored cache
+        env:
+          VLLM_ASCEND_BUILD_CACHE_DIR: ${{ env.BUILD_CACHE_DIR }}
+          VLLM_ASCEND_BUILD_CACHE_EVENT_LOG: /tmp/verify.events.jsonl
+          EXPECTED_OP: ${{ needs.restore-build-save.outputs.expected_op }}
+          EXPECTED_TP: ${{ needs.restore-build-save.outputs.expected_tp }}
+        run: |
+          set -euo pipefail
+
+          rm -rf csrc/build build
+          rm -f "$VLLM_ASCEND_BUILD_CACHE_EVENT_LOG" /tmp/verify-build.log
+          touch "$VLLM_ASCEND_BUILD_CACHE_EVENT_LOG"
+
+          set +u
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then
+            source /usr/local/Ascend/nnal/atb/set_env.sh
+          fi
+          set -u
+
+          arch="$(uname -i)"
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/Ascend/ascend-toolkit/latest/${arch}-linux/devlib"
+
+          start="$(date +%s)"
+          set +e
+          uv pip install -v -e . >/tmp/verify-build.log 2>&1
+          rc=$?
+          set -e
+          end="$(date +%s)"
+          seconds=$((end-start))
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Fresh-runner verification build failed"
+            tail -250 /tmp/verify-build.log || true
+            tail -150 "$VLLM_ASCEND_BUILD_CACHE_EVENT_LOG" || true
+            exit "$rc"
+          fi
+
+          python - "$VLLM_ASCEND_BUILD_CACHE_EVENT_LOG" <<'PY'
+          import collections
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          events = [
+              json.loads(line)
+              for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          ]
+          results = collections.Counter(
+              (e.get("domain"), e.get("status"))
+              for e in events
+              if e.get("event") == "cache_result"
+          )
+
+          op_hit = results[("custom_operator", "HIT")]
+          op_miss = results[("custom_operator", "MISS")]
+          op_bypass = results[("custom_operator", "BYPASS")]
+          tp_hit = results[("third_party", "HIT")]
+          tp_miss = results[("third_party", "MISS")]
+          tp_bypass = results[("third_party", "BYPASS")]
+          lock_timeouts = sum(e.get("event") == "lock_timeout" for e in events)
+          index_skipped = sum(e.get("event") == "index_skipped" for e in events)
+
+          expected_op = int(os.environ["EXPECTED_OP"])
+          expected_tp = int(os.environ["EXPECTED_TP"])
+
+          print("================ FRESH RUNNER VERDICT ================")
+          print(f"custom_operator HIT={op_hit}/{expected_op} MISS={op_miss} BYPASS={op_bypass}")
+          print(f"third_party HIT={tp_hit}/{expected_tp} MISS={tp_miss} BYPASS={tp_bypass}")
+          print(f"lock_timeout={lock_timeouts}")
+          print(f"index_skipped={index_skipped}")
+          print("======================================================")
+
+          failures = []
+          if op_hit != expected_op:
+              failures.append(f"custom_operator HIT expected={expected_op} actual={op_hit}")
+          if op_miss:
+              failures.append(f"custom_operator MISS expected=0 actual={op_miss}")
+          if op_bypass:
+              failures.append(f"custom_operator BYPASS expected=0 actual={op_bypass}")
+          if tp_hit != expected_tp:
+              failures.append(f"third_party HIT expected={expected_tp} actual={tp_hit}")
+          if tp_miss:
+              failures.append(f"third_party MISS expected=0 actual={tp_miss}")
+          if tp_bypass:
+              failures.append(f"third_party BYPASS expected=0 actual={tp_bypass}")
+          if lock_timeouts:
+              failures.append(f"lock_timeout expected=0 actual={lock_timeouts}")
+
+          if failures:
+              for failure in failures:
+                  print("ERROR:", failure)
+              raise SystemExit(1)
+          PY
+
+          if grep -Eq 'protoc: (No such file or directory|not found)|FileNotFoundError:|artifact ownership collision' /tmp/verify-build.log; then
+            echo "::error::Known build-cache correctness failure detected."
+            exit 1
+          fi
+
+          test -d vllm_ascend/_cann_ops_custom
+          find vllm_ascend -maxdepth 1 -name '*.so' -type f | grep -q .
+
+          {
+            echo "## Fresh-runner OBS verification"
+            echo "- exact OBS restore: **${{ steps.restore.outputs.cache-hit }}**"
+            echo "- key: \`${{ needs.restore-build-save.outputs.primary_key }}\`"
+            echo "- fresh-tree build: ${seconds}s"
+            echo "- expected custom-operator actions: ${{ needs.restore-build-save.outputs.expected_op }}"
+            echo "- expected third-party actions: ${{ needs.restore-build-save.outputs.expected_tp }}"
+          } >> "$GITHUB_STEP_SUMMARY"
