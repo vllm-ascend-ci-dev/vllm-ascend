@@ -55,6 +55,10 @@ jobs:
           ref: ${{ inputs.source_ref }}
           fetch-depth: 0
 
+      - name: Trust checkout for git introspection
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Run cache-engine unit and stress tests
         run: |
           set -euo pipefail
@@ -63,12 +67,16 @@ jobs:
           python -m pip install -q pytest
 
           echo "Running complete build-cache unit suite"
-          timeout 180s python -m pytest -q tests/ut/_tools/test_build_cache.py tests/ut/_tools/test_build_cache_concurrency.py
+          timeout 180s python -m pytest -q \
+            --confcutdir=tests/ut/_tools \
+            tests/ut/_tools/test_build_cache.py \
+            tests/ut/_tools/test_build_cache_concurrency.py
 
           echo "Repeating the high-concurrency HIT wave"
           for round in 1 2 3 4 5; do
             echo "[stress] round=${round}/5"
             timeout 60s python -m pytest -q \
+              --confcutdir=tests/ut/_tools \
               tests/ut/_tools/test_build_cache_concurrency.py \
               -k many_parallel_hits_complete_without_hang
           done
@@ -109,6 +117,10 @@ jobs:
           ref: ${{ inputs.source_ref }}
           fetch-depth: 0
           submodules: recursive
+
+      - name: Trust checkout for git introspection
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Record immutable source
         id: source
@@ -400,6 +412,10 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      - name: Trust checkout for git introspection
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Install build dependencies
         run: |
           set -euo pipefail
@@ -646,6 +662,10 @@ jobs:
           ref: ${{ needs.cache-seed-baseline.outputs.source_sha }}
           fetch-depth: 0
           submodules: recursive
+
+      - name: Trust checkout for git introspection
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Install build dependencies
         run: |
