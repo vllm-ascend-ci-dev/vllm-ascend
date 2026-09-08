@@ -129,9 +129,28 @@ jobs:
           set -euo pipefail
           rm -rf "$BUILD_CACHE_DIR" csrc/build build
 
+      - name: Validate OBS credentials
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.OBS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${AWS_ACCESS_KEY_ID}" || {
+            echo "::error::OBS_ACCESS_KEY secret is empty or unavailable."
+            exit 1
+          }
+          test -n "${AWS_SECRET_ACCESS_KEY}" || {
+            echo "::error::OBS_SECRET_KEY secret is empty or unavailable."
+            exit 1
+          }
+
       - name: Restore previous OBS snapshot
         id: restore
         uses: runs-on/cache/restore@v5
+        env:
+          RUNS_ON_RUNNER_NAME: ""
+          AWS_ACCESS_KEY_ID: ${{ secrets.OBS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_KEY }}
         with:
           path: ${{ env.BUILD_CACHE_DIR }}
           key: ${{ steps.keys.outputs.primary_key }}
@@ -435,9 +454,28 @@ jobs:
           set -euo pipefail
           rm -rf "$BUILD_CACHE_DIR" csrc/build build
 
+      - name: Validate OBS credentials
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.OBS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${AWS_ACCESS_KEY_ID}" || {
+            echo "::error::OBS_ACCESS_KEY secret is empty or unavailable."
+            exit 1
+          }
+          test -n "${AWS_SECRET_ACCESS_KEY}" || {
+            echo "::error::OBS_SECRET_KEY secret is empty or unavailable."
+            exit 1
+          }
+
       - name: Restore exact snapshot written by producer
         id: restore
         uses: runs-on/cache/restore@v5
+        env:
+          RUNS_ON_RUNNER_NAME: ""
+          AWS_ACCESS_KEY_ID: ${{ secrets.OBS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_KEY }}
         with:
           path: ${{ env.BUILD_CACHE_DIR }}
           key: ${{ needs.restore-build-save.outputs.primary_key }}
