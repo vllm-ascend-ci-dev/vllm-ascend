@@ -19,6 +19,12 @@ name: Cache csrc Build Artifacts
 
 on:
   workflow_dispatch:
+    inputs:
+      target_ids:
+        description: 'JSON array of csrc cache target IDs to build.'
+        type: string
+        required: false
+        default: '["a2-arm64-ubuntu"]'
 
 defaults:
   run:
@@ -42,10 +48,14 @@ jobs:
         with:
           ref: ${{ github.sha }}
 
-      - name: Resolve all cache targets
+      - name: Resolve requested cache targets
         id: targets
+        env:
+          TARGET_IDS: ${{ inputs.target_ids }}
         run: |
-          python3 .github/workflows/scripts/resolve_csrc_cache_targets.py --all
+          set -euo pipefail
+          python3 .github/workflows/scripts/resolve_csrc_cache_targets.py \
+            --target-ids "$TARGET_IDS"
 
       - name: Calculate csrc hash
         id: hash
