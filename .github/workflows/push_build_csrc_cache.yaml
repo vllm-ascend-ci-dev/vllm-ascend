@@ -256,10 +256,9 @@ jobs:
           sed -Ei 's@(ports|archive).ubuntu.com@cache-service.nginx-pypi-cache.svc.cluster.local:8081@g' /etc/apt/sources.list || true
           apt-get update -y
           apt-get install -y git zstd gcc g++ cmake libnuma-dev clang-15
-          pip install -v uv
           pip install -v uc-manager
-          uv pip install -v --system -r requirements-dev.txt
-          uv pip install -v --system --force-reinstall --no-deps triton-ascend==3.2.2
+          pip install -v -r requirements-dev.txt
+          pip install -v --force-reinstall --no-deps triton-ascend==3.2.2
 
       - name: Restore isolated source L1
         id: source-l1
@@ -278,7 +277,7 @@ jobs:
           if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then
             source /usr/local/Ascend/nnal/atb/set_env.sh
           fi
-          uv pip install -v --system -e . --no-build-isolation
+          pip install -v -e . --no-build-isolation
 
       - name: Summarize cache telemetry
         if: always()
