@@ -360,10 +360,12 @@ jobs:
           MAX_JOBS: "16"
         run: |
           set -euo pipefail
+          set +u
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
           if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then
             source /usr/local/Ascend/nnal/atb/set_env.sh
           fi
+          set -u
           uv pip install -v -e .
 
       - name: Summarize cache telemetry
