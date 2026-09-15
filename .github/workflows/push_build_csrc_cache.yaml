@@ -114,6 +114,20 @@ jobs:
               assert marker in text, (name, marker)
           PY
 
+      - name: Set up Python for cache-engine tests
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Run cache-engine unit tests
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check pytest regex
+          timeout 300s python -m pytest -q \
+            --confcutdir=tests/ut/_tools \
+            tests/ut/_tools/test_build_cache.py \
+            tests/ut/_tools/test_build_cache_concurrency.py
+
   prepare-producer:
     if: ${{ inputs.scenario == 'producer' }}
     runs-on: ubuntu-latest
