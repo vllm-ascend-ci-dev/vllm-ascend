@@ -1,90 +1,419 @@
 #
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# TEST-ONLY workflow for vllm-ascend-ci-dev/vllm-ascend.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# The filename intentionally matches a workflow present on the fork default
+# branch, allowing workflow_dispatch with --ref test/all-workflow-incremental-cache.
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# NEVER merge this validation harness verbatim into upstream.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# This file is a part of the vllm-ascend project.
-#
-
-name: Cache csrc Build Artifacts
+name: Validate persistent incremental csrc cache
 
 on:
-  push:
-    branches: ["main"]
-    paths:
-      - 'csrc/**'
-      - 'setup.py'
-      - 'pyproject.toml'
-      - 'CMakeLists.txt'
-      - 'cmake/**'
-      - 'packages.txt'
-      - '.github/workflows/_build_csrc_cache.yaml'
-      - '.github/workflows/scripts/csrc_cache_targets.json'
   workflow_dispatch:
+    inputs:
+      scenario:
+        description: Validation scenario
+        required: true
+        type: choice
+        default: static
+        options:
+          - static
+          - producer
+          - source
+          - doctest-source
+          - wheel-a2
+          - image-a2
+      target_id:
+        description: Producer target ID
+        required: false
+        type: string
+        default: a2-arm64-ubuntu
+      device:
+        description: Device for direct source validation
+        required: false
+        type: choice
+        default: a2
+        options:
+          - a2
+          - a3
+          - 310p
+          - a5
+      runner_override:
+        description: Optional CI-fork runner override
+        required: false
+        type: string
+        default: ''
 
 defaults:
   run:
     shell: bash -el {0}
 
 concurrency:
-  group: ascend-csrc-build-${{ github.workflow }}-${{ github.ref }}
+  group: incremental-cache-validation-${{ github.ref }}-${{ inputs.scenario }}-${{ inputs.target_id }}-${{ inputs.device }}
   cancel-in-progress: true
 
 jobs:
-  prepare-targets:
-    runs-on: linux-amd64-cpu-2-hk
-    container:
-      image: quay.io/ascend-ci/vllm-ascend:lint
+  static:
+    if: ${{ inputs.scenario == 'static' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate integration markers
+        run: |
+          set -euo pipefail
+          test -f .github/actions/csrc-l1-restore/action.yaml
+          test -f .github/actions/csrc-l1-save/action.yaml
+          test -x .github/workflows/scripts/export_csrc_l1_from_image.sh
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          targets = json.loads(
+              Path(".github/workflows/scripts/csrc_cache_targets.json")
+              .read_text(encoding="utf-8")
+          )
+          required_targets = {
+              "a2-arm64-ubuntu",
+              "a3-arm64-ubuntu",
+              "310p-arm64-ubuntu",
+              "a5-arm64-ubuntu",
+          }
+          assert required_targets <= set(targets)
+          assert all(
+              target.get("incremental_cache") is True
+              for target in targets.values()
+          )
+
+          ensure = Path(
+              ".github/workflows/_ensure_csrc_cache.yaml"
+          ).read_text(encoding="utf-8")
+          assert "lookup-a5" in ensure
+
+          markers = {
+              ".github/workflows/_selected_tests.yaml": "fallback-l1",
+              ".github/workflows/schedule_e2e_upstream_test.yaml":
+                  "fallback-l1",
+              ".github/workflows/schedule_main2main.yaml": "main2main-l1",
+              ".github/workflows/_e2e_nightly_single_node.yaml":
+                  "source-l1",
+              ".github/workflows/_e2e_nightly_single_node_560t.yaml":
+                  "source-l1",
+              ".github/workflows/_e2e_nightly_single_node_models.yaml":
+                  "source-l1",
+              ".github/workflows/schedule_doctest.yaml": "doctest-l1",
+              ".github/workflows/schedule_release_code_and_wheel.yml":
+                  "wheel-l1",
+              ".github/workflows/_schedule_image_build.yaml": "image-l1",
+              "tests/e2e/nightly/multi_node/scripts/run.sh":
+                  "VLLM_ASCEND_BUILD_CACHE_DIR",
+          }
+          for name, marker in markers.items():
+              text = Path(name).read_text(encoding="utf-8")
+              assert marker in text, (name, marker)
+          PY
+
+  prepare-producer:
+    if: ${{ inputs.scenario == 'producer' }}
+    runs-on: ubuntu-latest
     outputs:
-      targets: ${{ steps.targets.outputs.targets }}
+      target: ${{ steps.resolve.outputs.target }}
       csrc_hash: ${{ steps.hash.outputs.csrc_hash }}
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.sha }}
+      - uses: actions/checkout@v7
 
-      - name: Resolve all cache targets
-        id: targets
+      - name: Resolve production target with CI runner override
+        id: resolve
+        env:
+          TARGET_ID: ${{ inputs.target_id }}
+          RUNNER_OVERRIDE: ${{ inputs.runner_override }}
         run: |
-          python3 .github/workflows/scripts/resolve_csrc_cache_targets.py --all
+          set -euo pipefail
+          python3 .github/workflows/scripts/resolve_csrc_cache_targets.py \
+            --target-ids "[\"${TARGET_ID}\"]" > /tmp/targets.out
 
-      - name: Calculate csrc hash
+          TARGETS="$(sed -n 's/^targets=//p' /tmp/targets.out)"
+          python3 - "$TARGETS" "$RUNNER_OVERRIDE" >> "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import sys
+
+          target = json.loads(sys.argv[1])[0]
+          explicit = sys.argv[2].strip()
+          runner_by_device = {
+              "a2": "linux-aarch64-a2-2",
+              "a3": "linux-aarch64-a3-2",
+              "310p": "linux-aarch64-310p-2",
+              "a5": "linux-aarch64-a5-2",
+          }
+          if explicit:
+              target["runner"] = explicit
+          else:
+              target["runner"] = runner_by_device[target["device"]]
+
+          # Isolate both persistent L1 namespace and final L0 validation key.
+          target["id"] = target["id"] + "-ci-validation"
+          print("target=" + json.dumps(target, separators=(",", ":")))
+          PY
+
+      - name: Calculate isolated csrc hash
         id: hash
         run: |
-          # Fail closed: without pipefail, a git failure can be hidden by the
-          # pipeline and produce sha256(empty) as a valid-looking cache key.
           set -euo pipefail
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          cd "$GITHUB_WORKSPACE"
+          manifest="$(git ls-files -s -- csrc setup.py CMakeLists.txt cmake)"
+          test -n "$manifest"
+          digest="$(printf '%s\n' "$manifest" | sha256sum | awk '{print $1}')"
+          echo "csrc_hash=${digest}-ci-validation" >> "$GITHUB_OUTPUT"
 
-          # Limit invalidation to tracked inputs that can change csrc artifacts.
-          CSRC_MANIFEST=$(git ls-files -s -- csrc setup.py CMakeLists.txt cmake)
-          if [ -z "$CSRC_MANIFEST" ]; then
-            echo "::error::No tracked csrc inputs found."
-            exit 1
-          fi
-
-          CSRC_HASH=$(printf '%s\n' "$CSRC_MANIFEST" | sha256sum | awk '{print $1}')
-          echo "csrc_hash=$CSRC_HASH" >> "$GITHUB_OUTPUT"
-
-  build-cache:
-    needs: prepare-targets
-    strategy:
-      fail-fast: false
-      matrix:
-        target: ${{ fromJSON(needs.prepare-targets.outputs.targets) }}
+  producer:
+    if: ${{ inputs.scenario == 'producer' }}
+    needs: prepare-producer
     uses: ./.github/workflows/_build_csrc_cache.yaml
     with:
-      target: ${{ toJSON(matrix.target) }}
-      csrc_hash: ${{ needs.prepare-targets.outputs.csrc_hash }}
+      target: ${{ needs.prepare-producer.outputs.target }}
+      csrc_hash: ${{ needs.prepare-producer.outputs.csrc_hash }}
       source_ref: ${{ github.sha }}
+
+  prepare-source:
+    if: ${{ inputs.scenario == 'source' }}
+    runs-on: ubuntu-latest
+    outputs:
+      runner: ${{ steps.device.outputs.runner }}
+      image: ${{ steps.device.outputs.image }}
+      soc: ${{ steps.device.outputs.soc }}
+    steps:
+      - name: Resolve CI source-build environment
+        id: device
+        env:
+          DEVICE: ${{ inputs.device }}
+          RUNNER_OVERRIDE: ${{ inputs.runner_override }}
+        run: |
+          set -euo pipefail
+          case "$DEVICE" in
+            a2)
+              runner="linux-aarch64-a2-2"
+              image="swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12"
+              soc="ascend910b1"
+              ;;
+            a3)
+              runner="linux-aarch64-a3-2"
+              image="swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-a3-ubuntu22.04-py3.12"
+              soc="ascend910_9391"
+              ;;
+            310p)
+              runner="linux-aarch64-310p-2"
+              image="swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-310p-ubuntu22.04-py3.12"
+              soc="ascend310p1"
+              ;;
+            a5)
+              runner="linux-aarch64-a5-2"
+              image="swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-950-ubuntu22.04-py3.12"
+              soc="ascend950dt_9582"
+              ;;
+            *)
+              echo "::error::unknown device $DEVICE"
+              exit 1
+              ;;
+          esac
+          if [ -n "$RUNNER_OVERRIDE" ]; then
+            runner="$RUNNER_OVERRIDE"
+          fi
+          {
+            echo "runner=$runner"
+            echo "image=$image"
+            echo "soc=$soc"
+          } >> "$GITHUB_OUTPUT"
+
+  source:
+    if: ${{ inputs.scenario == 'source' }}
+    needs: prepare-source
+    runs-on: ${{ needs.prepare-source.outputs.runner }}
+    container:
+      image: ${{ needs.prepare-source.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install source-build dependencies
+        run: |
+          set -euo pipefail
+          sed -Ei 's@(ports|archive).ubuntu.com@cache-service.nginx-pypi-cache.svc.cluster.local:8081@g' /etc/apt/sources.list || true
+          apt-get update -y
+          apt-get install -y git zstd gcc g++ cmake libnuma-dev clang-15
+          pip install uv
+          pip install uc-manager
+          uv pip install -r requirements-dev.txt
+          uv pip install --force-reinstall --no-deps triton-ascend==3.2.2
+
+      - name: Restore isolated source L1
+        id: source-l1
+        uses: ./.github/actions/csrc-l1-restore
+        with:
+          cache-dir: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
+          compatibility-id: ci-source-${{ inputs.device }}-${{ needs.prepare-source.outputs.image }}-${{ runner.arch }}
+
+      - name: Compile from source
+        env:
+          SOC_VERSION: ${{ needs.prepare-source.outputs.soc }}
+          MAX_JOBS: "16"
+        run: |
+          set -euo pipefail
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then
+            source /usr/local/Ascend/nnal/atb/set_env.sh
+          fi
+          uv pip install -e . --no-build-isolation
+
+      - name: Summarize cache telemetry
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import collections
+          import json
+          import os
+          from pathlib import Path
+
+          event = Path(
+              os.environ.get("VLLM_ASCEND_BUILD_CACHE_EVENT_LOG", "")
+          )
+          if not event.is_file():
+              print("cache event log missing")
+              raise SystemExit(0)
+
+          events = [
+              json.loads(line)
+              for line in event.read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          ]
+          starts = collections.Counter(
+              e.get("domain")
+              for e in events
+              if e.get("event") == "action_start"
+          )
+          results = collections.Counter(
+              (e.get("domain"), e.get("status"))
+              for e in events
+              if e.get("event") == "cache_result"
+          )
+          print("action_start:", dict(starts))
+          print("cache_result:", dict(results))
+          print(
+              "lock_timeout:",
+              sum(e.get("event") == "lock_timeout" for e in events),
+          )
+          print(
+              "index_skipped:",
+              sum(e.get("event") == "index_skipped" for e in events),
+          )
+          PY
+
+      - name: Save isolated source L1
+        if: success()
+        uses: ./.github/actions/csrc-l1-save
+        with:
+          cache-dir: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
+          primary-key: ${{ steps.source-l1.outputs.primary-key }}
+
+  doctest-source:
+    if: ${{ inputs.scenario == 'doctest-source' }}
+    runs-on: ${{ inputs.runner_override != '' && inputs.runner_override || 'linux-aarch64-a2-2' }}
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Restore isolated doctest L1
+        id: doctest-l1
+        uses: ./.github/actions/csrc-l1-restore
+        with:
+          cache-dir: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
+          compatibility-id: ci-doctest-source-a2-${{ runner.arch }}
+          csrc-hash: adhoc
+
+      - name: Run real source-install doctest
+        run: |
+          set -euo pipefail
+          runtime_dir="$(mktemp -d)"
+          cd "$runtime_dir"
+          bash "$GITHUB_WORKSPACE/tests/e2e/doctests/scripts/run_doctests.sh" \
+            installation source
+
+      - name: Save isolated doctest L1
+        if: success()
+        uses: ./.github/actions/csrc-l1-save
+        with:
+          cache-dir: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
+          primary-key: ${{ steps.doctest-l1.outputs.primary-key }}
+
+  wheel-a2:
+    if: ${{ inputs.scenario == 'wheel-a2' }}
+    runs-on: ${{ inputs.runner_override != '' && inputs.runner_override || 'linux-aarch64-a2-2' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Restore isolated wheel L1
+        id: wheel-l1
+        uses: ./.github/actions/csrc-l1-restore
+        with:
+          cache-dir: ${{ github.workspace }}/build_cache
+          compatibility-id: ci-wheel-a2-arm64-py312
+
+      - name: Build A2 wheel image
+        run: |
+          set -euo pipefail
+          docker build \
+            -f .github/workflows/dockerfiles/Dockerfile.buildwheel.a2 \
+            --build-arg PY_VERSION=3.12 \
+            -t wheel-ci-validation:v1 .
+
+      - name: Export updated wheel L1
+        run: |
+          .github/workflows/scripts/export_csrc_l1_from_image.sh \
+            wheel-ci-validation:v1 \
+            "$GITHUB_WORKSPACE/build_cache" \
+            /workspace/vllm-ascend/build_cache
+
+      - name: Save isolated wheel L1
+        uses: ./.github/actions/csrc-l1-save
+        with:
+          cache-dir: ${{ github.workspace }}/build_cache
+          primary-key: ${{ steps.wheel-l1.outputs.primary-key }}
+
+  image-a2:
+    if: ${{ inputs.scenario == 'image-a2' }}
+    runs-on: ${{ inputs.runner_override != '' && inputs.runner_override || 'linux-aarch64-a2-2' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Restore isolated image-build L1
+        id: image-l1
+        uses: ./.github/actions/csrc-l1-restore
+        with:
+          cache-dir: ${{ github.workspace }}/build_cache
+          compatibility-id: ci-image-a2-arm64-910b
+
+      - name: Build real A2 Docker image
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg COMPILE_CUSTOM_KERNELS=1 \
+            -t vllm-ascend-image-ci-validation:v1 \
+            -f Dockerfile .
+
+      - name: Export updated image-build L1
+        run: |
+          .github/workflows/scripts/export_csrc_l1_from_image.sh \
+            vllm-ascend-image-ci-validation:v1 \
+            "$GITHUB_WORKSPACE/build_cache" \
+            /vllm-workspace/vllm-ascend/build_cache
+
+      - name: Save isolated image-build L1
+        uses: ./.github/actions/csrc-l1-save
+        with:
+          cache-dir: ${{ github.workspace }}/build_cache
+          primary-key: ${{ steps.image-l1.outputs.primary-key }}
