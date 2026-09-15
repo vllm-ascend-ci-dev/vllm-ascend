@@ -144,7 +144,8 @@ jobs:
           RUNNER_OVERRIDE: ${{ inputs.runner_override }}
         run: |
           set -euo pipefail
-          python3 .github/workflows/scripts/resolve_csrc_cache_targets.py \
+          env -u GITHUB_OUTPUT \
+            python3 .github/workflows/scripts/resolve_csrc_cache_targets.py \
             --target-ids "[\"${TARGET_ID}\"]" > /tmp/targets.out
 
           TARGETS="$(sed -n 's/^targets=//p' /tmp/targets.out)"
