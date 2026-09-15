@@ -245,6 +245,14 @@ jobs:
     runs-on: ${{ needs.prepare-source.outputs.runner }}
     container:
       image: ${{ needs.prepare-source.outputs.image }}
+    env:
+      UV_INDEX_URL: http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+      UV_EXTRA_INDEX_URL: "https://repo.huaweicloud.com/ascend/repos/pypi http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+      UV_INDEX_STRATEGY: unsafe-best-match
+      UV_INSECURE_HOST: cache-service.nginx-pypi-cache.svc.cluster.local
+      UV_HTTP_TIMEOUT: 120
+      UV_NO_CACHE: 1
+      UV_SYSTEM_PYTHON: 1
     steps:
       - uses: actions/checkout@v7
         with:
@@ -253,12 +261,20 @@ jobs:
       - name: Install source-build dependencies
         run: |
           set -euo pipefail
-          sed -Ei 's@(ports|archive).ubuntu.com@cache-service.nginx-pypi-cache.svc.cluster.local:8081@g' /etc/apt/sources.list || true
+          sed -Ei 's@(ports|archive).ubuntu.com@cache-service.nginx-pypi-cache.svc.cluster.local:8081@g' /etc/apt/sources.list
+          pip config set global.index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+          pip config set global.trusted-host cache-service.nginx-pypi-cache.svc.cluster.local
           apt-get update -y
-          apt-get install -y git zstd gcc g++ cmake libnuma-dev clang-15
+          apt-get install -y git zstd
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          xargs apt-get -y install < packages.txt
+          apt-get -y install gcc g++ cmake libnuma-dev clang-15
+          update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20
+          update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20
+          pip install -v uv
           pip install -v uc-manager
-          pip install -v -r requirements-dev.txt
-          pip install -v --force-reinstall --no-deps triton-ascend==3.2.2
+          uv pip install -v -r requirements-dev.txt
+          uv pip install -v --force-reinstall --no-deps triton-ascend==3.2.2
 
       - name: Restore isolated source L1
         id: source-l1
@@ -277,7 +293,7 @@ jobs:
           if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then
             source /usr/local/Ascend/nnal/atb/set_env.sh
           fi
-          pip install -v -e . --no-build-isolation
+          uv pip install -v -e .
 
       - name: Summarize cache telemetry
         if: always()
