@@ -276,12 +276,83 @@ jobs:
           uv pip install -v -r requirements-dev.txt
           uv pip install -v --force-reinstall --no-deps triton-ascend==3.2.2
 
-      - name: Restore isolated source L1
+      # Container runners in this CI fork do not expose the checkout to the
+      # host-side local-action resolver. Inline the TEST-ONLY wrapper while
+      # still exercising the same runs-on/cache backend as production.
+      - name: Prepare isolated source L1 key
         id: source-l1
-        uses: ./.github/actions/csrc-l1-restore
+        env:
+          CACHE_DIR: /tmp/vllm-ascend-incremental-build-cache
+          COMPATIBILITY_ID: ci-source-${{ inputs.device }}-${{ needs.prepare-source.outputs.image }}-${{ runner.arch }}
+        run: |
+          set -euo pipefail
+          engine="$GITHUB_WORKSPACE/csrc/scripts/build_cache.py"
+
+          rm -rf "$CACHE_DIR"
+          mkdir -p "$CACHE_DIR"
+
+          if [ ! -f "$engine" ]; then
+            echo "supported=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::This source snapshot predates the fine-grained csrc cache; building without L1."
+            exit 0
+          fi
+          echo "supported=true" >> "$GITHUB_OUTPUT"
+
+          schema="$(python3 - "$engine" <<'PYCODE'
+          import ast
+          import sys
+          from pathlib import Path
+
+          tree = ast.parse(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          for node in tree.body:
+              if isinstance(node, ast.Assign):
+                  for target in node.targets:
+                      if isinstance(target, ast.Name) and target.id == "SCHEMA_VERSION":
+                          print(ast.literal_eval(node.value))
+                          raise SystemExit(0)
+          raise SystemExit("SCHEMA_VERSION not found")
+          PYCODE
+          )"
+
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+          manifest="$(git -C "$GITHUB_WORKSPACE" ls-files -s -- csrc setup.py CMakeLists.txt cmake)"
+          if [ -n "$manifest" ]; then
+            csrc_hash="$(printf '%s\n' "$manifest" | sha256sum | awk '{print $1}')"
+          else
+            csrc_hash="adhoc"
+          fi
+
+          compat_digest="$(printf '%s' "$COMPATIBILITY_ID" | sha256sum | awk '{print $1}')"
+          compat_prefix="vllm-ascend-inc-v1-schema${schema}-${compat_digest}-"
+          same_csrc_prefix="${compat_prefix}${csrc_hash}-"
+          primary_key="${same_csrc_prefix}${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s%N)-$$-${RANDOM}"
+
+          {
+            echo "primary-key=$primary_key"
+            echo "csrc-hash=$csrc_hash"
+            echo "same-csrc-prefix=$same_csrc_prefix"
+            echo "compat-prefix=$compat_prefix"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "VLLM_ASCEND_BUILD_CACHE_DIR=$CACHE_DIR"
+            echo "VLLM_ASCEND_BUILD_CACHE_EVENT_LOG=${RUNNER_TEMP}/csrc-l1-${GITHUB_JOB}.jsonl"
+            echo "VLLM_ASCEND_BUILD_CACHE_ENTRY_LOCK_TIMEOUT_SECONDS=60"
+            echo "VLLM_ASCEND_BUILD_CACHE_ACTION_LOCK_TIMEOUT_SECONDS=120"
+            echo "VLLM_ASCEND_BUILD_CACHE_PUBLISH_LOCK_TIMEOUT_SECONDS=120"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore isolated source L1
+        id: source-l1-restore
+        if: steps.source-l1.outputs.supported == 'true'
+        continue-on-error: true
+        uses: runs-on/cache/restore@v5
         with:
-          cache-dir: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
-          compatibility-id: ci-source-${{ inputs.device }}-${{ needs.prepare-source.outputs.image }}-${{ runner.arch }}
+          path: /tmp/vllm-ascend-incremental-build-cache
+          key: ${{ steps.source-l1.outputs.primary-key }}
+          restore-keys: |
+            ${{ steps.source-l1.outputs.same-csrc-prefix }}
+            ${{ steps.source-l1.outputs.compat-prefix }}
 
       - name: Compile from source
         env:
@@ -338,12 +409,30 @@ jobs:
           )
           PY
 
-      - name: Save isolated source L1
+      - name: Inspect isolated source L1
+        id: source-l1-inspect
         if: success()
-        uses: ./.github/actions/csrc-l1-save
+        env:
+          CACHE_DIR: /tmp/vllm-ascend-incremental-build-cache
+          PRIMARY_KEY: ${{ steps.source-l1.outputs.primary-key }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PRIMARY_KEY" ] \
+            && [ -d "$CACHE_DIR" ] \
+            && find "$CACHE_DIR" -mindepth 1 -print -quit | grep -q .; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            du -sh "$CACHE_DIR" || true
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save isolated source L1
+        if: steps.source-l1-inspect.outputs.present == 'true'
+        continue-on-error: true
+        uses: runs-on/cache/save@v5
         with:
-          cache-dir: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
-          primary-key: ${{ steps.source-l1.outputs.primary-key }}
+          path: /tmp/vllm-ascend-incremental-build-cache
+          key: ${{ steps.source-l1.outputs.primary-key }}
 
   doctest-source:
     if: ${{ inputs.scenario == 'doctest-source' }}
