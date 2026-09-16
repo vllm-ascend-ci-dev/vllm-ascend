@@ -474,13 +474,66 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Restore isolated doctest L1
+      # Container runners in this CI fork do not expose the checkout to the
+      # host-side local-action resolver. Inline the TEST-ONLY wrapper while
+      # preserving the production key and runs-on/cache semantics.
+      - name: Prepare isolated doctest L1 key
         id: doctest-l1
-        uses: ./.github/actions/csrc-l1-restore
+        env:
+          CACHE_DIR: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
+          COMPATIBILITY_ID: ci-doctest-source-a2-${{ runner.arch }}
+        run: |
+          set -euo pipefail
+          engine="$GITHUB_WORKSPACE/csrc/scripts/build_cache.py"
+
+          rm -rf "$CACHE_DIR"
+          mkdir -p "$CACHE_DIR"
+
+          schema="$(python3 - "$engine" <<'PYCODE'
+          import ast
+          import sys
+          from pathlib import Path
+
+          tree = ast.parse(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          for node in tree.body:
+              if isinstance(node, ast.Assign):
+                  for target in node.targets:
+                      if isinstance(target, ast.Name) and target.id == "SCHEMA_VERSION":
+                          print(ast.literal_eval(node.value))
+                          raise SystemExit(0)
+          raise SystemExit("SCHEMA_VERSION not found")
+          PYCODE
+          )"
+
+          compat_digest="$(printf '%s' "$COMPATIBILITY_ID" | sha256sum | awk '{print $1}')"
+          compat_prefix="vllm-ascend-inc-v1-schema${schema}-${compat_digest}-"
+          same_csrc_prefix="${compat_prefix}adhoc-"
+          primary_key="${same_csrc_prefix}${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s%N)-$$-${RANDOM}"
+
+          {
+            echo "primary-key=$primary_key"
+            echo "same-csrc-prefix=$same_csrc_prefix"
+            echo "compat-prefix=$compat_prefix"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "VLLM_ASCEND_BUILD_CACHE_DIR=$CACHE_DIR"
+            echo "VLLM_ASCEND_BUILD_CACHE_EVENT_LOG=${RUNNER_TEMP}/csrc-l1-${GITHUB_JOB}.jsonl"
+            echo "VLLM_ASCEND_BUILD_CACHE_ENTRY_LOCK_TIMEOUT_SECONDS=60"
+            echo "VLLM_ASCEND_BUILD_CACHE_ACTION_LOCK_TIMEOUT_SECONDS=120"
+            echo "VLLM_ASCEND_BUILD_CACHE_PUBLISH_LOCK_TIMEOUT_SECONDS=120"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore isolated doctest L1
+        id: doctest-l1-restore
+        continue-on-error: true
+        uses: runs-on/cache/restore@v5
         with:
-          cache-dir: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
-          compatibility-id: ci-doctest-source-a2-${{ runner.arch }}
-          csrc-hash: adhoc
+          path: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
+          key: ${{ steps.doctest-l1.outputs.primary-key }}
+          restore-keys: |
+            ${{ steps.doctest-l1.outputs.same-csrc-prefix }}
+            ${{ steps.doctest-l1.outputs.compat-prefix }}
 
       - name: Run real source-install doctest
         run: |
@@ -490,12 +543,62 @@ jobs:
           bash "$GITHUB_WORKSPACE/tests/e2e/doctests/scripts/run_doctests.sh" \
             installation source
 
-      - name: Save isolated doctest L1
+      - name: Summarize doctest cache telemetry
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import collections
+          import json
+          import os
+          from pathlib import Path
+
+          event = Path(os.environ.get("VLLM_ASCEND_BUILD_CACHE_EVENT_LOG", ""))
+          if not event.is_file():
+              print("cache event log missing")
+              raise SystemExit(0)
+          events = [
+              json.loads(line)
+              for line in event.read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          ]
+          starts = collections.Counter(
+              e.get("domain") for e in events if e.get("event") == "action_start"
+          )
+          results = collections.Counter(
+              (e.get("domain"), e.get("status"))
+              for e in events
+              if e.get("event") == "cache_result"
+          )
+          print("action_start:", dict(starts))
+          print("cache_result:", dict(results))
+          print("lock_timeout:", sum(e.get("event") == "lock_timeout" for e in events))
+          print("index_skipped:", sum(e.get("event") == "index_skipped" for e in events))
+          PY
+
+      - name: Inspect isolated doctest L1
+        id: doctest-l1-inspect
         if: success()
-        uses: ./.github/actions/csrc-l1-save
+        env:
+          CACHE_DIR: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
+          PRIMARY_KEY: ${{ steps.doctest-l1.outputs.primary-key }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PRIMARY_KEY" ] \
+            && [ -d "$CACHE_DIR" ] \
+            && find "$CACHE_DIR" -mindepth 1 -print -quit | grep -q .; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            du -sh "$CACHE_DIR" || true
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save isolated doctest L1
+        if: steps.doctest-l1-inspect.outputs.present == 'true'
+        continue-on-error: true
+        uses: runs-on/cache/save@v5
         with:
-          cache-dir: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
-          primary-key: ${{ steps.doctest-l1.outputs.primary-key }}
+          path: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
+          key: ${{ steps.doctest-l1.outputs.primary-key }}
 
   wheel-a2:
     if: ${{ inputs.scenario == 'wheel-a2' }}
