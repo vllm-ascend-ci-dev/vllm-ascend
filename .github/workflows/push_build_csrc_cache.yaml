@@ -594,6 +594,26 @@ jobs:
               text.replace(upstream_clone, validation_source),
               encoding="utf-8",
           )
+
+          # The cache gate ends after the documented source installation. The
+          # following offline Quick Start exercises vLLM/vLLM-Ascend runtime
+          # API compatibility, which is a separate doctest concern and can
+          # fail when upstream vLLM main moves ahead of this validation SHA.
+          worker = Path("tests/e2e/doctests/002-installation-test.sh")
+          worker_text = worker.read_text(encoding="utf-8")
+          verification = (
+              '  run_shell_block installation-post-standard --expand-macros\n'
+              '  verify_installation_with_quickstart\n'
+          )
+          if worker_text.count(verification) != 1:
+              raise SystemExit("unexpected installation verification block")
+          worker.write_text(
+              worker_text.replace(
+                  verification,
+                  '  echo "TEST-ONLY: source installation completed"\n',
+              ),
+              encoding="utf-8",
+          )
           PY
           runtime_dir="$(mktemp -d)"
           cd "$runtime_dir"
