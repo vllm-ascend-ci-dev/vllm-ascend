@@ -607,6 +607,7 @@ jobs:
           drift = collections.Counter()
           comparable = 0
           samples = []
+          prepared_input_samples = []
           for identity, manifests in sorted(groups.items()):
               if len(manifests) < 2:
                   continue
@@ -619,11 +620,29 @@ jobs:
               drift[changed] += 1
               if len(samples) < 8:
                   samples.append((identity, len(manifests), changed))
+              if "prepared_input_hash" in changed and len(prepared_input_samples) < 3:
+                  input_maps = [
+                      {
+                          item.get("path"): item.get("sha256", item.get("target"))
+                          for item in manifest.get("prepared_inputs", [])
+                      }
+                      for manifest in manifests
+                  ]
+                  all_paths = sorted(set().union(*(mapping.keys() for mapping in input_maps)))
+                  changed_paths = [
+                      path
+                      for path in all_paths
+                      if len({mapping.get(path) for mapping in input_maps}) > 1
+                  ]
+                  prepared_input_samples.append(
+                      (identity, len(changed_paths), changed_paths[:20])
+                  )
 
           print("custom_manifest_groups:", len(groups))
           print("comparable_groups:", comparable)
           print("drift_signatures:", dict(drift))
           print("drift_samples:", samples)
+          print("prepared_input_drift_samples:", prepared_input_samples)
           PY
 
       - name: Run real source-install doctest
