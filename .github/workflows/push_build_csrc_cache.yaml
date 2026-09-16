@@ -695,17 +695,66 @@ jobs:
       - name: Build A2 wheel image
         run: |
           set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path(".github/workflows/dockerfiles/Dockerfile.buildwheel.a2")
+          text = source.read_text(encoding="utf-8")
+          marker = "# Install vllm-ascend\n"
+          if text.count(marker) != 1:
+              raise SystemExit("unexpected wheel Dockerfile install marker")
+          Path("/tmp/Dockerfile.buildwheel.a2").write_text(
+              text.replace(
+                  marker,
+                  marker
+                  + "ENV VLLM_ASCEND_BUILD_CACHE_EVENT_LOG="
+                  + "/tmp/csrc-l1-wheel.jsonl\n",
+              ),
+              encoding="utf-8",
+          )
+          PY
           docker build \
-            -f .github/workflows/dockerfiles/Dockerfile.buildwheel.a2 \
+            -f /tmp/Dockerfile.buildwheel.a2 \
             --build-arg PY_VERSION=3.12 \
             -t wheel-ci-validation:v1 .
 
       - name: Export updated wheel L1
         run: |
+          set -euo pipefail
           .github/workflows/scripts/export_csrc_l1_from_image.sh \
             wheel-ci-validation:v1 \
             "$GITHUB_WORKSPACE/build_cache" \
             /workspace/vllm-ascend/build_cache
+
+          container_id="$(docker create wheel-ci-validation:v1)"
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          docker cp \
+            "$container_id:/tmp/csrc-l1-wheel.jsonl" \
+            "$RUNNER_TEMP/csrc-l1-wheel.jsonl"
+          python3 - "$RUNNER_TEMP/csrc-l1-wheel.jsonl" <<'PY'
+          import collections
+          import json
+          import sys
+          from pathlib import Path
+
+          events = [
+              json.loads(line)
+              for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          ]
+          starts = collections.Counter(
+              e.get("domain") for e in events if e.get("event") == "action_start"
+          )
+          results = collections.Counter(
+              (e.get("domain"), e.get("status"))
+              for e in events
+              if e.get("event") == "cache_result"
+          )
+          print("action_start:", dict(starts))
+          print("cache_result:", dict(results))
+          print("lock_timeout:", sum(e.get("event") == "lock_timeout" for e in events))
+          print("index_skipped:", sum(e.get("event") == "index_skipped" for e in events))
+          PY
 
       - name: Save isolated wheel L1
         uses: ./.github/actions/csrc-l1-save
@@ -731,17 +780,66 @@ jobs:
       - name: Build real A2 Docker image
         run: |
           set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("Dockerfile")
+          text = source.read_text(encoding="utf-8")
+          marker = 'ARG COMPILE_CUSTOM_KERNELS=1\n'
+          if text.count(marker) != 1:
+              raise SystemExit("unexpected image Dockerfile compile marker")
+          Path("/tmp/Dockerfile.image-a2").write_text(
+              text.replace(
+                  marker,
+                  marker
+                  + "ENV VLLM_ASCEND_BUILD_CACHE_EVENT_LOG="
+                  + "/tmp/csrc-l1-image.jsonl\n",
+              ),
+              encoding="utf-8",
+          )
+          PY
           docker build \
             --build-arg COMPILE_CUSTOM_KERNELS=1 \
             -t vllm-ascend-image-ci-validation:v1 \
-            -f Dockerfile .
+            -f /tmp/Dockerfile.image-a2 .
 
       - name: Export updated image-build L1
         run: |
+          set -euo pipefail
           .github/workflows/scripts/export_csrc_l1_from_image.sh \
             vllm-ascend-image-ci-validation:v1 \
             "$GITHUB_WORKSPACE/build_cache" \
             /vllm-workspace/vllm-ascend/build_cache
+
+          container_id="$(docker create vllm-ascend-image-ci-validation:v1)"
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          docker cp \
+            "$container_id:/tmp/csrc-l1-image.jsonl" \
+            "$RUNNER_TEMP/csrc-l1-image.jsonl"
+          python3 - "$RUNNER_TEMP/csrc-l1-image.jsonl" <<'PY'
+          import collections
+          import json
+          import sys
+          from pathlib import Path
+
+          events = [
+              json.loads(line)
+              for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          ]
+          starts = collections.Counter(
+              e.get("domain") for e in events if e.get("event") == "action_start"
+          )
+          results = collections.Counter(
+              (e.get("domain"), e.get("status"))
+              for e in events
+              if e.get("event") == "cache_result"
+          )
+          print("action_start:", dict(starts))
+          print("cache_result:", dict(results))
+          print("lock_timeout:", sum(e.get("event") == "lock_timeout" for e in events))
+          print("index_skipped:", sum(e.get("event") == "index_skipped" for e in events))
+          PY
 
       - name: Save isolated image-build L1
         uses: ./.github/actions/csrc-l1-save
