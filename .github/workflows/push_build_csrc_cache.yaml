@@ -20,6 +20,7 @@ on:
           - static
           - producer
           - source
+          - selective-a3
           - doctest-source
           - wheel-a2
           - image-a2
@@ -190,12 +191,13 @@ jobs:
       source_ref: ${{ github.sha }}
 
   prepare-source:
-    if: ${{ inputs.scenario == 'source' }}
+    if: ${{ inputs.scenario == 'source' || inputs.scenario == 'selective-a3' }}
     runs-on: ubuntu-latest
     outputs:
       runner: ${{ steps.device.outputs.runner }}
       image: ${{ steps.device.outputs.image }}
       soc: ${{ steps.device.outputs.soc }}
+      device: ${{ steps.device.outputs.device }}
     steps:
       - name: Resolve CI source-build environment
         id: device
@@ -204,6 +206,9 @@ jobs:
           RUNNER_OVERRIDE: ${{ inputs.runner_override }}
         run: |
           set -euo pipefail
+          if [ "${{ inputs.scenario }}" = "selective-a3" ]; then
+            DEVICE="a3"
+          fi
           case "$DEVICE" in
             a2)
               runner="linux-aarch64-a2-2"
@@ -237,10 +242,11 @@ jobs:
             echo "runner=$runner"
             echo "image=$image"
             echo "soc=$soc"
+            echo "device=$DEVICE"
           } >> "$GITHUB_OUTPUT"
 
   source:
-    if: ${{ inputs.scenario == 'source' }}
+    if: ${{ inputs.scenario == 'source' || inputs.scenario == 'selective-a3' }}
     needs: prepare-source
     runs-on: ${{ needs.prepare-source.outputs.runner }}
     container:
@@ -283,7 +289,7 @@ jobs:
         id: source-l1
         env:
           CACHE_DIR: /tmp/vllm-ascend-incremental-build-cache
-          COMPATIBILITY_ID: ci-source-${{ inputs.device }}-${{ needs.prepare-source.outputs.image }}-${{ runner.arch }}
+          COMPATIBILITY_ID: ci-source-${{ needs.prepare-source.outputs.device }}-${{ needs.prepare-source.outputs.image }}-${{ runner.arch }}
         run: |
           set -euo pipefail
           engine="$GITHUB_WORKSPACE/csrc/scripts/build_cache.py"
@@ -354,6 +360,16 @@ jobs:
             ${{ steps.source-l1.outputs.same-csrc-prefix }}
             ${{ steps.source-l1.outputs.compat-prefix }}
 
+      - name: Mutate one operator-local input
+        if: inputs.scenario == 'selective-a3'
+        run: |
+          set -euo pipefail
+          target=csrc/attention/compressor_metadata/op_kernel/compressor_metadata.cpp
+          printf '\n// TEST-ONLY selective cache invalidation probe.\n' >> "$target"
+          git diff --check -- "$target"
+          test "$(git diff --name-only)" = "$target"
+          echo "Selective invalidation input: $target"
+
       - name: Compile from source
         env:
           SOC_VERSION: ${{ needs.prepare-source.outputs.soc }}
@@ -401,6 +417,18 @@ jobs:
           )
           print("action_start:", dict(starts))
           print("cache_result:", dict(results))
+          selective = sorted(
+              (
+                  e.get("domain"),
+                  e.get("unit"),
+                  e.get("action"),
+                  e.get("status"),
+              )
+              for e in events
+              if e.get("event") == "cache_result"
+              and e.get("status") != "HIT"
+          )
+          print("non_hit_actions:", selective)
           print(
               "lock_timeout:",
               sum(e.get("event") == "lock_timeout" for e in events),
@@ -429,7 +457,9 @@ jobs:
           fi
 
       - name: Save isolated source L1
-        if: steps.source-l1-inspect.outputs.present == 'true'
+        if: >-
+          inputs.scenario != 'selective-a3' &&
+          steps.source-l1-inspect.outputs.present == 'true'
         continue-on-error: true
         uses: runs-on/cache/save@v5
         with:
