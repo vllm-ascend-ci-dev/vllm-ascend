@@ -22,6 +22,7 @@ on:
           - source
           - selective-a3
           - doctest-source
+          - doctest-diagnose
           - wheel-a2
           - image-a2
       target_id:
@@ -501,7 +502,7 @@ jobs:
           key: ${{ steps.source-l1.outputs.primary-key }}
 
   doctest-source:
-    if: ${{ inputs.scenario == 'doctest-source' }}
+    if: ${{ inputs.scenario == 'doctest-source' || inputs.scenario == 'doctest-diagnose' }}
     runs-on: ${{ inputs.runner_override != '' && inputs.runner_override || 'linux-aarch64-a2-2' }}
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
@@ -569,7 +570,64 @@ jobs:
             ${{ steps.doctest-l1.outputs.same-csrc-prefix }}
             ${{ steps.doctest-l1.outputs.compat-prefix }}
 
+      - name: Diagnose doctest custom cache key drift
+        if: ${{ inputs.scenario == 'doctest-diagnose' }}
+        env:
+          CACHE_DIR: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import collections
+          import json
+          import os
+          from pathlib import Path
+
+          cache_dir = Path(os.environ["CACHE_DIR"])
+          groups = collections.defaultdict(list)
+          for manifest_path in cache_dir.rglob("manifest.json"):
+              try:
+                  manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+              except (OSError, json.JSONDecodeError):
+                  continue
+              if manifest.get("domain") != "custom_operator":
+                  continue
+              identity = (
+                  manifest.get("soc"),
+                  manifest.get("operator"),
+                  manifest.get("action"),
+              )
+              groups[identity].append(manifest)
+
+          fields = (
+              "operator_text_hash",
+              "prepared_input_hash",
+              "recipe_hash",
+              "compiler_environment_hash",
+          )
+          drift = collections.Counter()
+          comparable = 0
+          samples = []
+          for identity, manifests in sorted(groups.items()):
+              if len(manifests) < 2:
+                  continue
+              comparable += 1
+              changed = tuple(
+                  field
+                  for field in fields
+                  if len({manifest.get(field) for manifest in manifests}) > 1
+              )
+              drift[changed] += 1
+              if len(samples) < 8:
+                  samples.append((identity, len(manifests), changed))
+
+          print("custom_manifest_groups:", len(groups))
+          print("comparable_groups:", comparable)
+          print("drift_signatures:", dict(drift))
+          print("drift_samples:", samples)
+          PY
+
       - name: Run real source-install doctest
+        if: ${{ inputs.scenario == 'doctest-source' }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -621,7 +679,7 @@ jobs:
             installation source
 
       - name: Summarize doctest cache telemetry
-        if: always()
+        if: ${{ always() && inputs.scenario == 'doctest-source' }}
         run: |
           python3 - <<'PY'
           import collections
@@ -654,7 +712,7 @@ jobs:
 
       - name: Inspect isolated doctest L1
         id: doctest-l1-inspect
-        if: success()
+        if: ${{ success() && inputs.scenario == 'doctest-source' }}
         env:
           CACHE_DIR: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
           PRIMARY_KEY: ${{ steps.doctest-l1.outputs.primary-key }}
@@ -670,7 +728,7 @@ jobs:
           fi
 
       - name: Save isolated doctest L1
-        if: steps.doctest-l1-inspect.outputs.present == 'true'
+        if: ${{ inputs.scenario == 'doctest-source' && steps.doctest-l1-inspect.outputs.present == 'true' }}
         continue-on-error: true
         uses: runs-on/cache/save@v5
         with:
