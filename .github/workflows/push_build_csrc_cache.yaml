@@ -290,6 +290,7 @@ jobs:
         env:
           CACHE_DIR: /tmp/vllm-ascend-incremental-build-cache
           COMPATIBILITY_ID: ci-source-${{ needs.prepare-source.outputs.device }}-${{ needs.prepare-source.outputs.image }}-${{ runner.arch }}
+          DEVICE: ${{ needs.prepare-source.outputs.device }}
         run: |
           set -euo pipefail
           engine="$GITHUB_WORKSPACE/csrc/scripts/build_cache.py"
@@ -328,7 +329,14 @@ jobs:
             csrc_hash="adhoc"
           fi
 
-          compat_digest="$(printf '%s' "$COMPATIBILITY_ID" | sha256sum | awk '{print $1}')"
+          compatibility_id="$COMPATIBILITY_ID"
+          if [ "$DEVICE" = "a5" ]; then
+            # The full A5 operator set currently hits an unrelated upstream
+            # chunk_gated_delta_rule_fwd_h/toolchain failure. Keep this
+            # TEST-ONLY smoke snapshot isolated from the full A5 namespace.
+            compatibility_id="${compatibility_id}-smoke-causal-conv1d"
+          fi
+          compat_digest="$(printf '%s' "$compatibility_id" | sha256sum | awk '{print $1}')"
           compat_prefix="vllm-ascend-inc-v1-schema${schema}-${compat_digest}-"
           same_csrc_prefix="${compat_prefix}${csrc_hash}-"
           primary_key="${same_csrc_prefix}${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s%N)-$$-${RANDOM}"
@@ -369,6 +377,32 @@ jobs:
           git diff --check -- "$target"
           test "$(git diff --name-only)" = "$target"
           echo "Selective invalidation input: $target"
+
+      - name: Limit A5 smoke validation to one known-good operator
+        if: needs.prepare-source.outputs.device == 'a5'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("csrc/build_aclnn.sh")
+          text = path.read_text(encoding="utf-8")
+          branch = 'elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then'
+          branch_start = text.index(branch)
+          array_start = text.index("    CUSTOM_OPS_ARRAY=(", branch_start)
+          array_end = text.index("    )", array_start) + len("    )")
+          replacement = '''    CUSTOM_OPS_ARRAY=(
+              # TEST-ONLY A5 cache smoke probe. causal_conv1d produced valid
+              # artifacts before the unrelated full-build operator failure.
+              "causal_conv1d"
+          )'''
+          path.write_text(
+              text[:array_start] + replacement + text[array_end:],
+              encoding="utf-8",
+          )
+          PY
+          grep -A5 'matched SOC branch: ascend950' csrc/build_aclnn.sh
+          echo "A5 TEST-ONLY source scope: causal_conv1d"
 
       - name: Compile from source
         env:
