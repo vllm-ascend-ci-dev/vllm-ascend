@@ -584,7 +584,10 @@ jobs:
               "git clone --depth 1 --branch {{ vllm_ascend_version }} "
               "https://github.com/vllm-project/vllm-ascend.git"
           )
-          validation_source = 'cp -a "$GITHUB_WORKSPACE" vllm-ascend'
+          validation_source = (
+              'cp -a "$GITHUB_WORKSPACE" vllm-ascend\n'
+              'git config --global --add safe.directory "$PWD/vllm-ascend"'
+          )
           if text.count(upstream_clone) != 1:
               raise SystemExit("unexpected source-install clone block")
           doc.write_text(
