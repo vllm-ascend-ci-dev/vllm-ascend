@@ -28,7 +28,7 @@ import time
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 ARTIFACT_MODEL_BY_DOMAIN = {"third_party": 1, "custom_operator": 2}
 PUBLISH_STATE_SCHEMA = 1
 CHUNK_SIZE = 1024 * 1024
@@ -286,6 +286,7 @@ def _is_excluded(relative_path: str, excludes: Sequence[str]) -> bool:
 def _hash_prepared_inputs(
     paths: Sequence[Path],
     excludes: Sequence[str],
+    normalize_paths: Sequence[Path],
 ) -> tuple[str, list[dict]]:
     records: list[tuple[str, str]] = []
     manifest: list[dict] = []
@@ -306,7 +307,7 @@ def _hash_prepared_inputs(
             raise FileNotFoundError(f"prepared input does not exist: {path}")
 
         if path.is_file():
-            file_hash = _sha256_file(path)
+            file_hash = _hash_prepared_file(path, normalize_paths)
             logical_path = f"{label}/{path.name}"
             records.append((logical_path, file_hash))
             manifest.append({"path": logical_path, "kind": "file", "sha256": file_hash})
@@ -326,7 +327,7 @@ def _hash_prepared_inputs(
                 records.append((logical_path, f"symlink:{target}"))
                 manifest.append({"path": logical_path, "kind": "symlink", "target": target})
             elif child.is_file():
-                file_hash = _sha256_file(child)
+                file_hash = _hash_prepared_file(child, normalize_paths)
                 records.append((logical_path, file_hash))
                 manifest.append({"path": logical_path, "kind": "file", "sha256": file_hash})
 
@@ -343,6 +344,19 @@ def _looks_text(path: Path, data: bytes) -> bool:
     except UnicodeDecodeError:
         return False
     return True
+
+
+def _hash_prepared_file(path: Path, normalize_paths: Sequence[Path]) -> str:
+    data = path.read_bytes()
+    if _looks_text(path, data):
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        else:
+            normalized = _normalize_text(text, normalize_paths)
+            return _sha256_bytes(normalized.encode("utf-8"))
+    return _sha256_bytes(data)
 
 
 def _git_tracked_files(source_dir: Path, repo_root: Path) -> list[Path] | None:
@@ -1355,6 +1369,7 @@ def run(args: argparse.Namespace) -> int:
         _hash_prepared_inputs,
         prepared_inputs,
         excludes,
+        normalize_paths,
         event_fields=event_fields,
     )
 

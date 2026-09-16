@@ -631,6 +631,12 @@ function(add_bin_compile_target)
             if (EXISTS ${OPS_ADV_UTILS_KERNEL_INC})
                 list(APPEND _CACHE_PREPARED_INPUTS ${SRC_OUT_DIR}/ascendc/common)
             endif()
+            # The generated adapter embeds this absolute -include path. Its
+            # location is normalized by the cache wrapper, but its contents
+            # are a semantic compiler input and must remain identity-sensitive.
+            if (EXISTS ${VLLM_ASCEND_CANN_COMPAT_HEADER})
+                list(APPEND _CACHE_PREPARED_INPUTS ${VLLM_ASCEND_CANN_COMPAT_HEADER})
+            endif()
 
             # compiler_environment_hash: what compiler/toolkit produces it?
             set(_CACHE_ENVIRONMENT_FILES)

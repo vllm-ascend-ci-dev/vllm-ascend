@@ -335,6 +335,7 @@ def _prepared_path_key(
     root_name: str,
     prepared_payload: bytes,
     normalize_root: bool = True,
+    semantic_input_payload: bytes | None = None,
 ) -> str:
     root = tmp_path / root_name
     source = root / "source"
@@ -344,12 +345,17 @@ def _prepared_path_key(
     prepared = root / "prepared"
     prepared.mkdir()
     (prepared / "generated.py").write_bytes(prepared_payload)
+    prepared_inputs = [prepared]
+    if semantic_input_payload is not None:
+        semantic_input = root / "cann_compat.h"
+        semantic_input.write_bytes(semantic_input_payload)
+        prepared_inputs.append(semantic_input)
 
     output = root / "output"
     output.mkdir()
     proc = _run_cache(
         cache_root=tmp_path / "cache",
-        prepared_inputs=[prepared],
+        prepared_inputs=prepared_inputs,
         operator_source=source,
         output_dir=output,
         builder=_write_builder(tmp_path),
@@ -1409,6 +1415,36 @@ def test_top_level_prepared_input_symlink_tracks_link_and_target_content(
     assert "[build-cache] MISS" in changed.stdout
     assert _extract_key(changed) != key_b
     assert counter.read_text() == "3"
+
+
+def test_normalized_prepared_path_keeps_referenced_semantic_input_sensitive(
+    tmp_path: Path,
+):
+    root_a = tmp_path / "covered-a"
+    root_b = tmp_path / "covered-b"
+    root_changed = tmp_path / "covered-changed"
+    key_a = _prepared_path_key(
+        tmp_path,
+        root_name=root_a.name,
+        prepared_payload=f'HEADER = "{root_a}/cann_compat.h"\n'.encode(),
+        semantic_input_payload=b"#define COMPAT 1\n",
+    )
+    key_b = _prepared_path_key(
+        tmp_path,
+        root_name=root_b.name,
+        prepared_payload=f'HEADER = "{root_b}/cann_compat.h"\n'.encode(),
+        semantic_input_payload=b"#define COMPAT 1\n",
+    )
+    key_changed = _prepared_path_key(
+        tmp_path,
+        root_name=root_changed.name,
+        prepared_payload=(
+            f'HEADER = "{root_changed}/cann_compat.h"\n'.encode()
+        ),
+        semantic_input_payload=b"#define COMPAT 2\n",
+    )
+    assert key_b == key_a
+    assert key_changed != key_a
 
 
 def test_save_entry_rolls_back_old_entry_if_publish_replace_fails(
