@@ -538,6 +538,26 @@ jobs:
       - name: Run real source-install doctest
         run: |
           set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          doc = Path(
+              "docs/source/getting_started/installation/"
+              "install_vllm_ascend.inc.md"
+          )
+          text = doc.read_text(encoding="utf-8")
+          upstream_clone = (
+              "git clone --depth 1 --branch {{ vllm_ascend_version }} "
+              "https://github.com/vllm-project/vllm-ascend.git"
+          )
+          validation_source = 'cp -a "$GITHUB_WORKSPACE" vllm-ascend'
+          if text.count(upstream_clone) != 1:
+              raise SystemExit("unexpected source-install clone block")
+          doc.write_text(
+              text.replace(upstream_clone, validation_source),
+              encoding="utf-8",
+          )
+          PY
           runtime_dir="$(mktemp -d)"
           cd "$runtime_dir"
           bash "$GITHUB_WORKSPACE/tests/e2e/doctests/scripts/run_doctests.sh" \
