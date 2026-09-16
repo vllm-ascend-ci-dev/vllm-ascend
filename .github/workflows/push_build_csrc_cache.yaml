@@ -23,6 +23,7 @@ on:
           - selective-a3
           - doctest-source
           - doctest-diagnose
+          - doctest-root-diff
           - wheel-a2
           - image-a2
       target_id:
@@ -775,6 +776,197 @@ jobs:
         with:
           path: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
           key: ${{ steps.doctest-l1.outputs.primary-key }}
+
+  doctest-root-diff:
+    if: ${{ inputs.scenario == 'doctest-root-diff' }}
+    runs-on: ${{ inputs.runner_override != '' && inputs.runner_override || 'linux-aarch64-a2-2' }}
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-910b-ubuntu22.04-py3.12
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Prepare TEST-ONLY root-diff source installation
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          doc = Path(
+              "docs/source/getting_started/installation/"
+              "install_vllm_ascend.inc.md"
+          )
+          text = doc.read_text(encoding="utf-8")
+          upstream_clone = (
+              "git clone --depth 1 --branch {{ vllm_ascend_version }} "
+              "https://github.com/vllm-project/vllm-ascend.git"
+          )
+          validation_source = (
+              'cp -a "$GITHUB_WORKSPACE" vllm-ascend\n'
+              'git config --global --add safe.directory "$PWD/vllm-ascend"'
+          )
+          if text.count(upstream_clone) != 1:
+              raise SystemExit("unexpected source-install clone block")
+          doc.write_text(
+              text.replace(upstream_clone, validation_source),
+              encoding="utf-8",
+          )
+
+          worker = Path("tests/e2e/doctests/002-installation-test.sh")
+          worker_text = worker.read_text(encoding="utf-8")
+          verification = (
+              '  run_shell_block installation-post-standard --expand-macros\n'
+              '  verify_installation_with_quickstart\n'
+          )
+          if worker_text.count(verification) != 1:
+              raise SystemExit("unexpected installation verification block")
+          worker_text = worker_text.replace(
+              verification,
+              '  echo "TEST-ONLY: source installation completed"\n',
+          )
+          random_work_dir = (
+              '  WORK_DIR="$(mktemp -d)"\n'
+              '  trap cleanup_installation EXIT\n'
+          )
+          selected_work_dir = (
+              '  WORK_DIR="${DIAG_WORK_DIR}"\n'
+              '  rm -rf "${WORK_DIR}"\n'
+              '  mkdir -p "${WORK_DIR}"\n'
+              '  trap cleanup_installation EXIT\n'
+          )
+          if worker_text.count(random_work_dir) != 1:
+              raise SystemExit("unexpected doctest work-dir block")
+          worker_text = worker_text.replace(random_work_dir, selected_work_dir)
+          cleanup = '    rm -rf "${WORK_DIR}"\n'
+          preserve = (
+              '    if [[ "${PRESERVE_WORK_DIR:-0}" != "1" ]]; then\n'
+              '      rm -rf "${WORK_DIR}"\n'
+              '    fi\n'
+          )
+          if worker_text.count(cleanup) != 1:
+              raise SystemExit("unexpected doctest cleanup block")
+          worker.write_text(
+              worker_text.replace(cleanup, preserve),
+              encoding="utf-8",
+          )
+
+          setup = Path("setup.py")
+          setup_text = setup.read_text(encoding="utf-8")
+          cmake_tail = "        cmake_args += [source_dir]\n"
+          selected_op = (
+              '        cmake_args += ["-DASCEND_OP_NAME=add_rms_norm_bias"]\n'
+              "        cmake_args += [source_dir]\n"
+          )
+          if setup_text.count(cmake_tail) != 1:
+              raise SystemExit("unexpected setup.py CMake argument block")
+          setup.write_text(
+              setup_text.replace(cmake_tail, selected_op),
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Build equivalent source trees under two roots
+        env:
+          PRESERVE_WORK_DIR: "1"
+        run: |
+          set -euo pipefail
+          set +u
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then
+            source /usr/local/Ascend/nnal/atb/set_env.sh
+          fi
+          set -u
+
+          samples="$RUNNER_TEMP/doctest-root-diff"
+          rm -rf "$samples"
+          mkdir -p "$samples"
+
+          for label in a b; do
+            export DIAG_WORK_DIR="$RUNNER_TEMP/doctest-mktemp-${label}"
+            export VLLM_ASCEND_BUILD_CACHE_DIR="$RUNNER_TEMP/doctest-cache-${label}"
+            rm -rf "$DIAG_WORK_DIR" "$VLLM_ASCEND_BUILD_CACHE_DIR"
+            runtime_dir="$(mktemp -d)"
+            (
+              cd "$runtime_dir"
+              bash "$GITHUB_WORKSPACE/tests/e2e/doctests/scripts/run_doctests.sh" \
+                installation source
+            )
+
+            source_root="$DIAG_WORK_DIR/source/vllm-ascend"
+            generated="$(find "$source_root" -type f \
+              -path '*/src/add_rms_norm_bias/AddRmsNormBias.py' \
+              -print -quit)"
+            if [ -z "$generated" ]; then
+              echo "AddRmsNormBias.py was not generated" >&2
+              exit 1
+            fi
+            cp "$generated" "$samples/AddRmsNormBias-${label}.py"
+            printf '%s\n' "$source_root" > "$samples/source-root-${label}.txt"
+            cache_file="$(find "$source_root" -name CMakeCache.txt \
+              -type f -print -quit)"
+            if [ -z "$cache_file" ]; then
+              echo "CMakeCache.txt was not generated" >&2
+              exit 1
+            fi
+            dirname "$cache_file" > "$samples/binary-root-${label}.txt"
+          done
+
+      - name: Compare generated prepared inputs
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import difflib
+          import hashlib
+          import os
+          from pathlib import Path
+
+          samples = Path(os.environ["RUNNER_TEMP"]) / "doctest-root-diff"
+          a = samples.joinpath("AddRmsNormBias-a.py").read_text(encoding="utf-8")
+          b = samples.joinpath("AddRmsNormBias-b.py").read_text(encoding="utf-8")
+          source_a = samples.joinpath("source-root-a.txt").read_text().strip()
+          source_b = samples.joinpath("source-root-b.txt").read_text().strip()
+          binary_a = samples.joinpath("binary-root-a.txt").read_text().strip()
+          binary_b = samples.joinpath("binary-root-b.txt").read_text().strip()
+
+          def sha(text):
+              return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+          normalize_a = a.replace(source_a, "<SOURCE_ROOT>").replace(
+              binary_a, "<BINARY_ROOT>"
+          )
+          normalize_b = b.replace(source_b, "<SOURCE_ROOT>").replace(
+              binary_b, "<BINARY_ROOT>"
+          )
+          for path in (
+              os.environ.get("ASCEND_HOME_PATH", ""),
+              os.environ.get("ASCEND_TOOLKIT_HOME", ""),
+          ):
+              if path:
+                  normalize_a = normalize_a.replace(path, "<ASCEND_ROOT>")
+                  normalize_b = normalize_b.replace(path, "<ASCEND_ROOT>")
+
+          print("source_root_a:", source_a)
+          print("source_root_b:", source_b)
+          print("binary_root_a:", binary_a)
+          print("binary_root_b:", binary_b)
+          print("raw_sha_a:", sha(a))
+          print("raw_sha_b:", sha(b))
+          print("normalized_sha_a:", sha(normalize_a))
+          print("normalized_sha_b:", sha(normalize_b))
+          print("normalized_equal:", normalize_a == normalize_b)
+          print("limited_unified_diff:")
+          diff = list(
+              difflib.unified_diff(
+                  a.splitlines(),
+                  b.splitlines(),
+                  fromfile="root-a/AddRmsNormBias.py",
+                  tofile="root-b/AddRmsNormBias.py",
+                  lineterm="",
+              )
+          )
+          for line in diff[:120]:
+              print(line)
+          print("diff_lines_total:", len(diff))
+          PY
 
   wheel-a2:
     if: ${{ inputs.scenario == 'wheel-a2' }}
