@@ -691,6 +691,28 @@ jobs:
               ),
               encoding="utf-8",
           )
+
+          # Production doctest creates a fresh mktemp source root on every
+          # run. The generated operator Python inputs embed that root, so the
+          # TEST-ONLY cold/warm gate uses a deterministic runner path while
+          # preserving the documented source-install commands themselves.
+          worker_text = worker.read_text(encoding="utf-8")
+          random_work_dir = (
+              '  WORK_DIR="$(mktemp -d)"\n'
+              '  trap cleanup_installation EXIT\n'
+          )
+          stable_work_dir = (
+              '  WORK_DIR="${RUNNER_TEMP}/doctest-source-work"\n'
+              '  rm -rf "${WORK_DIR}"\n'
+              '  mkdir -p "${WORK_DIR}"\n'
+              '  trap cleanup_installation EXIT\n'
+          )
+          if worker_text.count(random_work_dir) != 1:
+              raise SystemExit("unexpected doctest work-dir block")
+          worker.write_text(
+              worker_text.replace(random_work_dir, stable_work_dir),
+              encoding="utf-8",
+          )
           PY
           runtime_dir="$(mktemp -d)"
           cd "$runtime_dir"
