@@ -2,7 +2,9 @@
 name: PR16718 OBS transport validation
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - test/pr16718-review-fix
 
 permissions:
   contents: read
@@ -19,9 +21,9 @@ jobs:
 
       - name: Confirm existing OBS writer authorization
         env:
-          HW_OBS_AK: ${{ secrets.HW_OBS_AK }}
-          HW_OBS_SK: ${{ secrets.HW_OBS_SK }}
-        run: test -n "$HW_OBS_AK" && test -n "$HW_OBS_SK"
+          OBS_ACCESS_KEY: ${{ secrets.OBS_ACCESS_KEY }}
+          OBS_SECRET_KEY: ${{ secrets.OBS_SECRET_KEY }}
+        run: test -n "$OBS_ACCESS_KEY" && test -n "$OBS_SECRET_KEY"
 
       - name: Restore isolated L1 namespace
         id: restore
@@ -48,8 +50,8 @@ jobs:
         with:
           cache-dir: ${{ runner.temp }}/pr16718-obs-cache
           primary-key: ${{ steps.restore.outputs.primary-key }}
-          access-key-id: ${{ secrets.HW_OBS_AK }}
-          secret-access-key: ${{ secrets.HW_OBS_SK }}
+          access-key-id: ${{ secrets.OBS_ACCESS_KEY }}
+          secret-access-key: ${{ secrets.OBS_SECRET_KEY }}
 
   consumer:
     needs: producer
