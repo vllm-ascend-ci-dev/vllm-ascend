@@ -2,9 +2,7 @@
 name: PR16718 OBS transport validation
 
 on:
-  push:
-    branches:
-      - test/pr16718-review-fix
+  workflow_dispatch:
 
 permissions:
   contents: read
