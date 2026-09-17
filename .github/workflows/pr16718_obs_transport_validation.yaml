@@ -1,0 +1,83 @@
+# TEST-ONLY: isolated OBS round-trip for PR #16718.
+name: PR16718 OBS transport validation
+
+on:
+  push:
+    branches:
+      - test/pr16718-review-fix
+
+permissions:
+  contents: read
+
+jobs:
+  producer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      primary-key: ${{ steps.restore.outputs.primary-key }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Confirm existing OBS writer authorization
+        env:
+          HW_OBS_AK: ${{ secrets.HW_OBS_AK }}
+          HW_OBS_SK: ${{ secrets.HW_OBS_SK }}
+        run: test -n "$HW_OBS_AK" && test -n "$HW_OBS_SK"
+
+      - name: Restore isolated L1 namespace
+        id: restore
+        uses: ./.github/actions/csrc-l1-restore
+        with:
+          cache-dir: ${{ runner.temp }}/pr16718-obs-cache
+          architecture: x64
+          soc-version: a2
+          toolchain-image: validation.invalid/pr16718-obs:cbf1bd66b
+          source-root: .
+          csrc-hash: pr16718-obs-transport-cbf1bd66b
+
+      - name: Add isolated validation entry
+        env:
+          CACHE_DIR: ${{ runner.temp }}/pr16718-obs-cache
+        run: |
+          set -euo pipefail
+          mkdir -p "$CACHE_DIR"
+          printf '%s\n' 'formal-production-sha=cbf1bd66b021aa247eec4b34d2143943bb07dcfa' > "$CACHE_DIR/validation-sentinel"
+          touch "$CACHE_DIR/.updated"
+
+      - name: Save isolated L1 namespace
+        uses: ./.github/actions/csrc-l1-save
+        with:
+          cache-dir: ${{ runner.temp }}/pr16718-obs-cache
+          primary-key: ${{ steps.restore.outputs.primary-key }}
+          access-key-id: ${{ secrets.HW_OBS_AK }}
+          secret-access-key: ${{ secrets.HW_OBS_SK }}
+
+  consumer:
+    needs: producer
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Restore isolated L1 namespace
+        id: restore
+        uses: ./.github/actions/csrc-l1-restore
+        with:
+          cache-dir: ${{ runner.temp }}/pr16718-obs-cache
+          architecture: x64
+          soc-version: a2
+          toolchain-image: validation.invalid/pr16718-obs:cbf1bd66b
+          source-root: .
+          csrc-hash: pr16718-obs-transport-cbf1bd66b
+
+      - name: Verify independent OBS restore
+        env:
+          CACHE_DIR: ${{ runner.temp }}/pr16718-obs-cache
+          MATCHED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          set -euo pipefail
+          test -n "$MATCHED_KEY"
+          grep -Fx 'formal-production-sha=cbf1bd66b021aa247eec4b34d2143943bb07dcfa' "$CACHE_DIR/validation-sentinel"
+          test ! -e "$CACHE_DIR/.updated"
