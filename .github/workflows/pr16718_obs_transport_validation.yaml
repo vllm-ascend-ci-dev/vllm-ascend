@@ -13,9 +13,9 @@ env:
   TEST_OBS_BUCKET: obs-guiiyang1-ascend-test
   TEST_OBS_ENDPOINT: https://obs.cn-southwest-2.myhuaweicloud.com
   TEST_OBS_REGION: cn-southwest-2
-  TEST_TOOLCHAIN_IMAGE: validation.invalid/pr16718-real-l1:68f-v1
-  TEST_CSRC_HASH: pr16718-real-l1-68f-source-a-v1
-  TEST_COMPAT_CSRC_HASH: pr16718-real-l1-68f-source-b-v1
+  TEST_TOOLCHAIN_IMAGE: "validation.invalid/pr16718-real-l1:${{ github.run_id }}-${{ github.run_attempt }}"
+  TEST_CSRC_HASH: "pr16718-real-l1-${{ github.run_id }}-${{ github.run_attempt }}-source-a"
+  TEST_COMPAT_CSRC_HASH: "pr16718-real-l1-${{ github.run_id }}-${{ github.run_attempt }}-source-b"
 
 jobs:
   producer:
