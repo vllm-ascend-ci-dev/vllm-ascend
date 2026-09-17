@@ -62,5 +62,35 @@ jobs:
           print(f'parsed {len(paths)} YAML files')
           PY
 
+      - name: Check credential-less cache coordinator contract
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          import yaml
+
+          path = Path('.github/workflows/_ensure_csrc_cache.yaml')
+          workflow = yaml.safe_load(path.read_text(encoding='utf-8'))
+          prepare = workflow['jobs']['prepare-cache-checks']
+          build = workflow['jobs']['build-missing-caches']
+
+          assert prepare['outputs']['has_write_credentials'] == (
+              '$' + '{{ steps.writer-credentials.outputs.present }}'
+          )
+          detector = next(
+              step
+              for step in prepare['steps']
+              if step.get('id') == 'writer-credentials'
+          )
+          assert detector['env'] == {
+              'HW_OBS_AK': '$' + '{{ secrets.HW_OBS_AK }}',
+              'HW_OBS_SK': '$' + '{{ secrets.HW_OBS_SK }}',
+          }
+          condition = build['if']
+          assert "has_missing == 'true'" in condition
+          assert "has_write_credentials == 'true'" in condition
+          print('credential-less coordinator remains lookup-only')
+          PY
+
       - name: Check patch whitespace
         run: git diff --check HEAD~2..HEAD
