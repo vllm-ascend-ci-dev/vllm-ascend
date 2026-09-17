@@ -1,4 +1,4 @@
-# TEST-ONLY: isolated OBS round-trip for PR #16718.
+# TEST-ONLY: real L1 OBS round-trip and restore hierarchy for PR #16718.
 name: PR16718 OBS transport validation
 
 on:
@@ -10,11 +10,12 @@ permissions:
   contents: read
 
 env:
-  # TEST-ONLY transport owned by the CI fork. Production keeps its existing
-  # ascend-ci-cache-hk / ap-southeast-1 contract.
   TEST_OBS_BUCKET: obs-guiiyang1-ascend-test
   TEST_OBS_ENDPOINT: https://obs.cn-southwest-2.myhuaweicloud.com
   TEST_OBS_REGION: cn-southwest-2
+  TEST_TOOLCHAIN_IMAGE: validation.invalid/pr16718-real-l1:68f-v1
+  TEST_CSRC_HASH: pr16718-real-l1-68f-source-a-v1
+  TEST_COMPAT_CSRC_HASH: pr16718-real-l1-68f-source-b-v1
 
 jobs:
   producer:
@@ -25,11 +26,13 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_KEY }}
     outputs:
       primary-key: ${{ steps.restore.outputs.primary-key }}
+      compatibility-prefix: ${{ steps.keys.outputs.compatibility-prefix }}
+      same-csrc-prefix: ${{ steps.keys.outputs.same-csrc-prefix }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v7
 
-      - name: Confirm existing OBS writer authorization
+      - name: Confirm TEST OBS writer authorization
         run: test -n "$AWS_ACCESS_KEY_ID" && test -n "$AWS_SECRET_ACCESS_KEY"
 
       - name: Select CI-fork OBS transport
@@ -48,35 +51,98 @@ jobs:
             grep -F "AWS_REGION: ${TEST_OBS_REGION}" "$action"
           done
 
-      - name: Restore isolated L1 namespace
+      - name: Record restore hierarchy
+        id: keys
+        run: |
+          set -euo pipefail
+          mapfile -t key_parts < <(
+            python3 csrc/scripts/build_cache.py snapshot-key \
+              --architecture x64 \
+              --soc-version a2 \
+              --toolchain-image "$TEST_TOOLCHAIN_IMAGE" \
+              --csrc-hash "$TEST_CSRC_HASH" \
+              --unique-suffix evidence
+          )
+          test "${#key_parts[@]}" -eq 3
+          echo "same-csrc-prefix=${key_parts[1]}" >> "$GITHUB_OUTPUT"
+          echo "compatibility-prefix=${key_parts[2]}" >> "$GITHUB_OUTPUT"
+          printf 'primary_template=%s\nsame_csrc_prefix=%s\ncompatibility_prefix=%s\n' \
+            "${key_parts[0]}" "${key_parts[1]}" "${key_parts[2]}"
+
+      - name: Restore isolated real L1 namespace
         id: restore
         uses: ./.github/actions/csrc-l1-restore
         with:
-          cache-dir: ${{ runner.temp }}/pr16718-obs-cache
+          cache-dir: ${{ runner.temp }}/pr16718-real-l1-cache
           architecture: x64
           soc-version: a2
-          toolchain-image: validation.invalid/pr16718-obs:cbf1bd66b
+          toolchain-image: ${{ env.TEST_TOOLCHAIN_IMAGE }}
           source-root: .
-          csrc-hash: pr16718-obs-transport-cbf1bd66b
+          csrc-hash: ${{ env.TEST_CSRC_HASH }}
 
-      - name: Add isolated validation entry
+      - name: Create semantic inputs
         env:
-          CACHE_DIR: ${{ runner.temp }}/pr16718-obs-cache
+          WORK_DIR: ${{ runner.temp }}/pr16718-real-l1-work
         run: |
           set -euo pipefail
-          mkdir -p "$CACHE_DIR"
-          printf '%s\n' 'formal-production-sha=cbf1bd66b021aa247eec4b34d2143943bb07dcfa' > "$CACHE_DIR/validation-sentinel"
-          touch "$CACHE_DIR/.updated"
+          mkdir -p \
+            "$WORK_DIR/source" "$WORK_DIR/prepared" "$WORK_DIR/stage" \
+            "$WORK_DIR/output" "$WORK_DIR/publish-state"
+          printf '%s\n' 'int source = 1;' > "$WORK_DIR/source/kernel.cpp"
+          printf '%s\n' 'int prepared = 1;' > "$WORK_DIR/prepared/kernel.cpp"
 
-      - name: Save isolated L1 namespace
+      - name: Execute real cold cache action
+        env:
+          CACHE_DIR: ${{ runner.temp }}/pr16718-real-l1-cache
+          EVENT_LOG: ${{ runner.temp }}/pr16718-producer.jsonl
+          WORK_DIR: ${{ runner.temp }}/pr16718-real-l1-work
+        run: |
+          set -euo pipefail
+          export VLLM_ASCEND_BUILD_CACHE_EVENT_LOG="$EVENT_LOG"
+          python3 csrc/scripts/build_cache.py run \
+            --cache-root "$CACHE_DIR" \
+            --domain custom_operator \
+            --unit obs_validation \
+            --soc ascend910b \
+            --operator ObsValidation \
+            --action ObsValidation-0 \
+            --operator-source "$WORK_DIR/source" \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --output-dir "$WORK_DIR/stage" \
+            --publish-dir "$WORK_DIR/output" \
+            --publish-state-dir "$WORK_DIR/publish-state" \
+            --prepared-input "$WORK_DIR/prepared" \
+            --recipe-value recipe-v1 \
+            --environment-profile host-cxx \
+            --environment-tool cc \
+            --normalize-path "$WORK_DIR" \
+            --artifact-include kernel.o \
+            -- bash -c 'test ! -e "$3/fail-if-compiled"; mkdir -p "$2"; cp "$1" "$2/kernel.o"' \
+              _ "$WORK_DIR/prepared/kernel.cpp" "$WORK_DIR/stage" "$WORK_DIR"
+          python3 - "$EVENT_LOG" <<'PY'
+          import collections
+          import json
+          import sys
+
+          counts = collections.Counter(
+              json.loads(line)["status"]
+              for line in open(sys.argv[1], encoding="utf-8")
+              if json.loads(line).get("event") == "cache_result"
+          )
+          print(f"producer_counts={dict(counts)}")
+          assert counts == {"MISS": 1, "SAVED": 1}, counts
+          PY
+          test -f "$CACHE_DIR/.updated"
+
+      - name: Save real L1 snapshot
         uses: ./.github/actions/csrc-l1-save
         with:
-          cache-dir: ${{ runner.temp }}/pr16718-obs-cache
+          cache-dir: ${{ runner.temp }}/pr16718-real-l1-cache
           primary-key: ${{ steps.restore.outputs.primary-key }}
           access-key-id: ${{ secrets.OBS_ACCESS_KEY }}
           secret-access-key: ${{ secrets.OBS_SECRET_KEY }}
 
-  consumer:
+  same-csrc-consumer:
     needs: producer
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -95,30 +161,180 @@ jobs:
             -e "s#https://obs.ap-southeast-1.myhuaweicloud.com#${TEST_OBS_ENDPOINT}#g" \
             -e "s/ap-southeast-1/${TEST_OBS_REGION}/g" \
             .github/actions/csrc-l1-restore/action.yaml
-          grep -F "RUNS_ON_S3_BUCKET_CACHE: ${TEST_OBS_BUCKET}" \
-            .github/actions/csrc-l1-restore/action.yaml
-          grep -F "RUNS_ON_S3_BUCKET_ENDPOINT: ${TEST_OBS_ENDPOINT}" \
-            .github/actions/csrc-l1-restore/action.yaml
-          grep -F "AWS_REGION: ${TEST_OBS_REGION}" \
-            .github/actions/csrc-l1-restore/action.yaml
 
-      - name: Restore isolated L1 namespace
+      - name: Restore same-csrc snapshot
         id: restore
         uses: ./.github/actions/csrc-l1-restore
         with:
-          cache-dir: ${{ runner.temp }}/pr16718-obs-cache
+          cache-dir: ${{ runner.temp }}/pr16718-real-l1-cache
           architecture: x64
           soc-version: a2
-          toolchain-image: validation.invalid/pr16718-obs:cbf1bd66b
+          toolchain-image: ${{ env.TEST_TOOLCHAIN_IMAGE }}
           source-root: .
-          csrc-hash: pr16718-obs-transport-cbf1bd66b
+          csrc-hash: ${{ env.TEST_CSRC_HASH }}
 
-      - name: Verify independent OBS restore
+      - name: Verify same-csrc selection and inner HIT
         env:
-          CACHE_DIR: ${{ runner.temp }}/pr16718-obs-cache
+          CACHE_DIR: ${{ runner.temp }}/pr16718-real-l1-cache
+          EVENT_LOG: ${{ runner.temp }}/pr16718-same-csrc.jsonl
+          EXPECTED_KEY: ${{ needs.producer.outputs.primary-key }}
           MATCHED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+          WORK_DIR: ${{ runner.temp }}/pr16718-real-l1-work
         run: |
           set -euo pipefail
           test -n "$MATCHED_KEY"
-          grep -Fx 'formal-production-sha=cbf1bd66b021aa247eec4b34d2143943bb07dcfa' "$CACHE_DIR/validation-sentinel"
+          test "$MATCHED_KEY" = "$EXPECTED_KEY"
+          mkdir -p \
+            "$WORK_DIR/source" "$WORK_DIR/prepared" "$WORK_DIR/stage" \
+            "$WORK_DIR/output" "$WORK_DIR/publish-state"
+          printf '%s\n' 'int source = 1;' > "$WORK_DIR/source/kernel.cpp"
+          printf '%s\n' 'int prepared = 1;' > "$WORK_DIR/prepared/kernel.cpp"
+          touch "$WORK_DIR/fail-if-compiled"
+          export VLLM_ASCEND_BUILD_CACHE_EVENT_LOG="$EVENT_LOG"
+          python3 csrc/scripts/build_cache.py run \
+            --cache-root "$CACHE_DIR" --domain custom_operator \
+            --unit obs_validation --soc ascend910b \
+            --operator ObsValidation --action ObsValidation-0 \
+            --operator-source "$WORK_DIR/source" --repo-root "$GITHUB_WORKSPACE" \
+            --output-dir "$WORK_DIR/stage" --publish-dir "$WORK_DIR/output" \
+            --publish-state-dir "$WORK_DIR/publish-state" \
+            --prepared-input "$WORK_DIR/prepared" \
+            --recipe-value recipe-v1 --environment-profile host-cxx \
+            --environment-tool cc --normalize-path "$WORK_DIR" \
+            --artifact-include kernel.o \
+            -- bash -c 'test ! -e "$3/fail-if-compiled"; mkdir -p "$2"; cp "$1" "$2/kernel.o"' \
+              _ "$WORK_DIR/prepared/kernel.cpp" "$WORK_DIR/stage" "$WORK_DIR"
+          grep -q '"status":"HIT"' "$EVENT_LOG"
           test ! -e "$CACHE_DIR/.updated"
+          test -f "$WORK_DIR/output/kernel.o"
+          echo "matched_key=$MATCHED_KEY"
+
+  compatible-csrc-consumer:
+    needs: producer
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.OBS_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_KEY }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Select CI-fork OBS transport
+        run: |
+          set -euo pipefail
+          sed -i \
+            -e "s/ascend-ci-cache-hk/${TEST_OBS_BUCKET}/g" \
+            -e "s#https://obs.ap-southeast-1.myhuaweicloud.com#${TEST_OBS_ENDPOINT}#g" \
+            -e "s/ap-southeast-1/${TEST_OBS_REGION}/g" \
+            .github/actions/csrc-l1-restore/action.yaml
+
+      - name: Restore compatible historical snapshot
+        id: restore
+        uses: ./.github/actions/csrc-l1-restore
+        with:
+          cache-dir: ${{ runner.temp }}/pr16718-real-l1-cache
+          architecture: x64
+          soc-version: a2
+          toolchain-image: ${{ env.TEST_TOOLCHAIN_IMAGE }}
+          source-root: .
+          csrc-hash: ${{ env.TEST_COMPAT_CSRC_HASH }}
+
+      - name: Verify compatibility fallback and inner HIT
+        env:
+          CACHE_DIR: ${{ runner.temp }}/pr16718-real-l1-cache
+          EVENT_LOG: ${{ runner.temp }}/pr16718-compatible.jsonl
+          EXPECTED_KEY: ${{ needs.producer.outputs.primary-key }}
+          MATCHED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+          WORK_DIR: ${{ runner.temp }}/pr16718-real-l1-work
+        run: |
+          set -euo pipefail
+          test -n "$MATCHED_KEY"
+          test "$MATCHED_KEY" = "$EXPECTED_KEY"
+          mkdir -p \
+            "$WORK_DIR/source" "$WORK_DIR/prepared" "$WORK_DIR/stage" \
+            "$WORK_DIR/output" "$WORK_DIR/publish-state"
+          printf '%s\n' 'int source = 1;' > "$WORK_DIR/source/kernel.cpp"
+          printf '%s\n' 'int prepared = 1;' > "$WORK_DIR/prepared/kernel.cpp"
+          touch "$WORK_DIR/fail-if-compiled"
+          export VLLM_ASCEND_BUILD_CACHE_EVENT_LOG="$EVENT_LOG"
+          python3 csrc/scripts/build_cache.py run \
+            --cache-root "$CACHE_DIR" --domain custom_operator \
+            --unit obs_validation --soc ascend910b \
+            --operator ObsValidation --action ObsValidation-0 \
+            --operator-source "$WORK_DIR/source" --repo-root "$GITHUB_WORKSPACE" \
+            --output-dir "$WORK_DIR/stage" --publish-dir "$WORK_DIR/output" \
+            --publish-state-dir "$WORK_DIR/publish-state" \
+            --prepared-input "$WORK_DIR/prepared" \
+            --recipe-value recipe-v1 --environment-profile host-cxx \
+            --environment-tool cc --normalize-path "$WORK_DIR" \
+            --artifact-include kernel.o \
+            -- bash -c 'test ! -e "$3/fail-if-compiled"; mkdir -p "$2"; cp "$1" "$2/kernel.o"' \
+              _ "$WORK_DIR/prepared/kernel.cpp" "$WORK_DIR/stage" "$WORK_DIR"
+          grep -q '"status":"HIT"' "$EVENT_LOG"
+          test ! -e "$CACHE_DIR/.updated"
+          echo "matched_key=$MATCHED_KEY"
+
+  incompatible-consumer:
+    needs: producer
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.OBS_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_KEY }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Select CI-fork OBS transport
+        run: |
+          set -euo pipefail
+          sed -i \
+            -e "s/ascend-ci-cache-hk/${TEST_OBS_BUCKET}/g" \
+            -e "s#https://obs.ap-southeast-1.myhuaweicloud.com#${TEST_OBS_ENDPOINT}#g" \
+            -e "s/ap-southeast-1/${TEST_OBS_REGION}/g" \
+            .github/actions/csrc-l1-restore/action.yaml
+
+      - name: Restore incompatible namespace
+        id: restore
+        uses: ./.github/actions/csrc-l1-restore
+        with:
+          cache-dir: ${{ runner.temp }}/pr16718-real-l1-cache
+          architecture: x64
+          soc-version: a2
+          toolchain-image: validation.invalid/pr16718-incompatible:${{ github.run_id }}
+          source-root: .
+          csrc-hash: ${{ env.TEST_COMPAT_CSRC_HASH }}
+
+      - name: Verify incompatible namespace is cold
+        env:
+          CACHE_DIR: ${{ runner.temp }}/pr16718-real-l1-cache
+          EVENT_LOG: ${{ runner.temp }}/pr16718-incompatible.jsonl
+          MATCHED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+          WORK_DIR: ${{ runner.temp }}/pr16718-incompatible-work
+        run: |
+          set -euo pipefail
+          test -z "$MATCHED_KEY"
+          mkdir -p \
+            "$WORK_DIR/source" "$WORK_DIR/prepared" "$WORK_DIR/stage" \
+            "$WORK_DIR/output" "$WORK_DIR/publish-state"
+          printf '%s\n' 'int source = 1;' > "$WORK_DIR/source/kernel.cpp"
+          printf '%s\n' 'int prepared = 1;' > "$WORK_DIR/prepared/kernel.cpp"
+          export VLLM_ASCEND_BUILD_CACHE_EVENT_LOG="$EVENT_LOG"
+          python3 csrc/scripts/build_cache.py run \
+            --cache-root "$CACHE_DIR" --domain custom_operator \
+            --unit obs_validation --soc ascend910b \
+            --operator ObsValidation --action ObsValidation-0 \
+            --operator-source "$WORK_DIR/source" --repo-root "$GITHUB_WORKSPACE" \
+            --output-dir "$WORK_DIR/stage" --publish-dir "$WORK_DIR/output" \
+            --publish-state-dir "$WORK_DIR/publish-state" \
+            --prepared-input "$WORK_DIR/prepared" \
+            --recipe-value recipe-v1 --environment-profile host-cxx \
+            --environment-tool cc --normalize-path "$WORK_DIR" \
+            --artifact-include kernel.o \
+            -- bash -c 'test ! -e "$3/fail-if-compiled"; mkdir -p "$2"; cp "$1" "$2/kernel.o"' \
+              _ "$WORK_DIR/prepared/kernel.cpp" "$WORK_DIR/stage" "$WORK_DIR"
+          grep -q '"status":"MISS"' "$EVENT_LOG"
+          grep -q '"status":"SAVED"' "$EVENT_LOG"
+          test -f "$CACHE_DIR/.updated"
+          echo 'matched_key=<empty>'
