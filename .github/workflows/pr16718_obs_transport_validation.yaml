@@ -28,6 +28,8 @@ jobs:
       primary-key: ${{ steps.restore.outputs.primary-key }}
       compatibility-prefix: ${{ steps.keys.outputs.compatibility-prefix }}
       same-csrc-prefix: ${{ steps.keys.outputs.same-csrc-prefix }}
+      snapshot-digest: ${{ steps.readers.outputs.snapshot-digest }}
+      read-start-epoch: ${{ steps.readers.outputs.read-start-epoch }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v7
@@ -142,6 +144,20 @@ jobs:
           access-key-id: ${{ secrets.OBS_ACCESS_KEY }}
           secret-access-key: ${{ secrets.OBS_SECRET_KEY }}
 
+      - name: Prepare concurrent read window
+        id: readers
+        env:
+          CACHE_DIR: ${{ runner.temp }}/pr16718-real-l1-cache
+        run: |
+          set -euo pipefail
+          file_count="$(find "$CACHE_DIR" -type f ! -name .updated | wc -l)"
+          test "$file_count" -gt 0
+          digest="$(cd "$CACHE_DIR" && find . -type f ! -name .updated -print0 \
+            | sort -z | xargs -0 -r sha256sum | sha256sum | awk '{print $1}')"
+          echo "snapshot-digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "read-start-epoch=$(($(date +%s) + 30))" >> "$GITHUB_OUTPUT"
+          echo "snapshot_digest=$digest file_count=$file_count"
+
   same-csrc-consumer:
     needs: producer
     runs-on: ubuntu-latest
@@ -208,6 +224,74 @@ jobs:
           test ! -e "$CACHE_DIR/.updated"
           test -f "$WORK_DIR/output/kernel.o"
           echo "matched_key=$MATCHED_KEY"
+
+  concurrent-read-consumers:
+    needs: producer
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      max-parallel: 32
+      matrix:
+        reader: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.OBS_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_KEY }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Select CI-fork OBS transport
+        run: |
+          set -euo pipefail
+          sed -i \
+            -e "s/ascend-ci-cache-hk/${TEST_OBS_BUCKET}/g" \
+            -e "s#https://obs.ap-southeast-1.myhuaweicloud.com#${TEST_OBS_ENDPOINT}#g" \
+            -e "s/ap-southeast-1/${TEST_OBS_REGION}/g" \
+            .github/actions/csrc-l1-restore/action.yaml
+
+      - name: Align read start and record timing
+        env:
+          READ_START_EPOCH: ${{ needs.producer.outputs.read-start-epoch }}
+        run: |
+          set -euo pipefail
+          now="$(date +%s)"
+          if [ "$now" -lt "$READ_START_EPOCH" ]; then
+            sleep "$((READ_START_EPOCH - now))"
+          fi
+          echo "OBS_READ_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Restore shared TEST OBS snapshot
+        id: restore
+        uses: ./.github/actions/csrc-l1-restore
+        with:
+          cache-dir: ${{ runner.temp }}/pr16718-real-l1-cache
+          architecture: x64
+          soc-version: a2
+          toolchain-image: ${{ env.TEST_TOOLCHAIN_IMAGE }}
+          source-root: .
+          csrc-hash: ${{ env.TEST_CSRC_HASH }}
+
+      - name: Verify exact key and snapshot integrity
+        env:
+          CACHE_DIR: ${{ runner.temp }}/pr16718-real-l1-cache
+          EXPECTED_KEY: ${{ needs.producer.outputs.primary-key }}
+          EXPECTED_DIGEST: ${{ needs.producer.outputs.snapshot-digest }}
+          MATCHED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+          READER: ${{ matrix.reader }}
+        run: |
+          set -euo pipefail
+          end_ns="$(date +%s%N)"
+          test -n "$MATCHED_KEY"
+          test "$MATCHED_KEY" = "$EXPECTED_KEY"
+          file_count="$(find "$CACHE_DIR" -type f ! -name .updated | wc -l)"
+          test "$file_count" -gt 0
+          digest="$(cd "$CACHE_DIR" && find . -type f ! -name .updated -print0 \
+            | sort -z | xargs -0 -r sha256sum | sha256sum | awk '{print $1}')"
+          test "$digest" = "$EXPECTED_DIGEST"
+          elapsed_ms="$(((end_ns - OBS_READ_START_NS) / 1000000))"
+          echo "OBS_READ_RESULT reader=$READER runner=$RUNNER_NAME start_ns=$OBS_READ_START_NS end_ns=$end_ns elapsed_ms=$elapsed_ms matched_key=$MATCHED_KEY digest=$digest file_count=$file_count"
 
   compatible-csrc-consumer:
     needs: producer
