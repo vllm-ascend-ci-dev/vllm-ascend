@@ -79,11 +79,11 @@ env:
   # L1: persistent fine-grained build cache. L0 remains the exact final-artifact
   # cache consumed by test jobs.
   INCREMENTAL_BUILD_CACHE_DIR: /tmp/vllm-ascend-incremental-build-cache
-  RUNS_ON_S3_BUCKET_CACHE: ascend-ci-cache-hk
-  RUNS_ON_S3_BUCKET_ENDPOINT: https://obs.ap-southeast-1.myhuaweicloud.com
+  RUNS_ON_S3_BUCKET_CACHE: obs-guiiyang1-ascend-test
+  RUNS_ON_S3_BUCKET_ENDPOINT: https://obs.cn-southwest-2.myhuaweicloud.com
   RUNS_ON_S3_FORCE_PATH_STYLE: "false"
   AWS_S3_FORCE_PATH_STYLE: "false"
-  AWS_REGION: ap-southeast-1
+  AWS_REGION: cn-southwest-2
   RUNS_ON_RUNNER_NAME: ""
 
 jobs:
@@ -223,6 +223,62 @@ jobs:
             echo "::error::The csrc build does not contain a top-level shared library."
             exit 1
           fi
+
+      # A same-run L0 handoff does not require shared OBS write credentials.
+      # Tar preserves executable bits and symlinks across upload-artifact.
+      - name: Package complete csrc artifacts
+        id: l0-package
+        env:
+          TARGET_ID: ${{ fromJSON(inputs.target).id }}
+          CSRC_HASH: ${{ inputs.csrc_hash }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import os
+          import tarfile
+          from pathlib import Path
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          artifact = f"csrc-l0-{os.environ['TARGET_ID']}-{os.environ['CSRC_HASH']}"
+          output = Path(os.environ["RUNNER_TEMP"]) / artifact
+          output.mkdir(parents=True, exist_ok=True)
+          archive = output / "csrc-l0.tar"
+
+          candidates = [
+              root / "vllm_ascend/_cann_ops_custom",
+              *sorted((root / "vllm_ascend").glob("*.so")),
+              root / "vllm_ascend/lib",
+              root / "vllm_ascend/include",
+          ]
+          paths = [path for path in candidates if path.exists() or path.is_symlink()]
+          if not any(path.suffix == ".so" for path in paths):
+              raise SystemExit("complete L0 requires a top-level shared library")
+          with tarfile.open(archive, "w") as tar:
+              for path in paths:
+                  tar.add(path, arcname=str(path.relative_to(root)))
+
+          hasher = hashlib.sha256()
+          with archive.open("rb") as contents:
+              for chunk in iter(lambda: contents.read(1024 * 1024), b""):
+                  hasher.update(chunk)
+          digest = hasher.hexdigest()
+          (output / "csrc-l0.tar.sha256").write_text(
+              f"{digest}  csrc-l0.tar\n", encoding="utf-8"
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as outputs:
+              print(f"artifact={artifact}", file=outputs)
+              print(f"path={output}", file=outputs)
+          print(f"L0 artifact: {artifact}; files: {len(paths)}; sha256: {digest}")
+          PY
+
+      - name: Upload complete csrc artifacts for this workflow
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.l0-package.outputs.artifact }}
+          path: ${{ steps.l0-package.outputs.path }}
+          if-no-files-found: error
+          retention-days: 1
 
       # L1 transport failure is a performance degradation, not a correctness
       # failure. The verified final L0 artifact can still be published.
