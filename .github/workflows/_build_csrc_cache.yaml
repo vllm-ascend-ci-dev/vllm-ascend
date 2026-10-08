@@ -63,10 +63,10 @@ defaults:
     shell: bash -el {0}
 
 env:
-  UV_INDEX_URL: http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
-  UV_EXTRA_INDEX_URL: "https://repo.huaweicloud.com/ascend/repos/pypi http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+  # TEST-ONLY: private validation does not have the production cluster DNS.
+  UV_INDEX_URL: https://pypi.org/simple
+  UV_EXTRA_INDEX_URL: "https://repo.huaweicloud.com/ascend/repos/pypi https://download.pytorch.org/whl/cpu"
   UV_INDEX_STRATEGY: unsafe-best-match
-  UV_INSECURE_HOST: cache-service.nginx-pypi-cache.svc.cluster.local
   UV_HTTP_TIMEOUT: 120
   UV_NO_CACHE: 1
   UV_SYSTEM_PYTHON: 1
@@ -74,11 +74,11 @@ env:
   # L1: persistent fine-grained build cache. L0 remains the exact final-artifact
   # cache consumed by test jobs.
   INCREMENTAL_BUILD_CACHE_DIR: /tmp/vllm-ascend-incremental-build-cache
-  RUNS_ON_S3_BUCKET_CACHE: ascend-ci-cache-hk
-  RUNS_ON_S3_BUCKET_ENDPOINT: https://obs.ap-southeast-1.myhuaweicloud.com
+  RUNS_ON_S3_BUCKET_CACHE: obs-guiiyang1-ascend-test
+  RUNS_ON_S3_BUCKET_ENDPOINT: https://obs.cn-southwest-2.myhuaweicloud.com
   RUNS_ON_S3_FORCE_PATH_STYLE: "false"
   AWS_S3_FORCE_PATH_STYLE: "false"
-  AWS_REGION: ap-southeast-1
+  AWS_REGION: cn-southwest-2
   RUNS_ON_RUNNER_NAME: ""
 
 jobs:
@@ -102,9 +102,7 @@ jobs:
       - name: Config mirrors (ubuntu)
         if: fromJSON(inputs.target).os == 'ubuntu'
         run: |
-          sed -Ei 's@(ports|archive).ubuntu.com@cache-service.nginx-pypi-cache.svc.cluster.local:8081@g' /etc/apt/sources.list
-          pip config set global.index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
-          pip config set global.trusted-host cache-service.nginx-pypi-cache.svc.cluster.local
+          pip config set global.index-url https://pypi.org/simple
           apt-get update -y
           apt-get install -y git zstd
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -209,18 +207,19 @@ jobs:
         id: incremental-cache-restore
         continue-on-error: true
         if: steps.restored-outputs.outputs.ready != 'true'
-        uses: $/.github/actions/csrc-l1-restore
+        uses: ./.github/actions/csrc-l1-restore
         with:
           cache-dir: ${{ env.INCREMENTAL_BUILD_CACHE_DIR }}
           architecture: ${{ fromJSON(inputs.target).cache_arch }}
           soc-version: ${{ fromJSON(inputs.target).soc_version }}
           csrc-hash: ${{ inputs.csrc_hash }}
+          toolchain-image: validation.invalid/cpu-l0-20261008:${{ fromJSON(inputs.target).image_tag }}
 
       - name: Install vllm-ascend
         if: steps.restored-outputs.outputs.ready != 'true'
         env:
           SOC_VERSION: ${{ fromJSON(inputs.target).soc_version }}
-          MAX_JOBS: '16'
+          MAX_JOBS: '4'
           TORCH_DEVICE_BACKEND_AUTOLOAD: '0'
           VLLM_ASCEND_BUILD_CACHE_DIR: ${{ env.INCREMENTAL_BUILD_CACHE_DIR }}
           VLLM_ASCEND_BUILD_CACHE_EVENT_LOG: ${{ runner.temp }}/csrc-cpu-build.jsonl
@@ -261,6 +260,14 @@ jobs:
           python3 .csrc-cache-workflow/.github/workflows/scripts/csrc_l0_artifact.py pack \
             --source-root . --artifact-dir "$ARTIFACT_DIR"
 
+      - name: Upload CPU telemetry
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cpu-telemetry-${{ inputs.csrc_hash }}
+          path: ${{ runner.temp }}/csrc-cpu-build.jsonl
+          if-no-files-found: warn
+
       # Same-run transport is mandatory, including PRs without OBS secrets.
       # Shared persistence is optional and cannot send compilation to NPU jobs.
       - name: Upload complete csrc artifact
@@ -277,7 +284,7 @@ jobs:
       - name: Save incremental build cache
         continue-on-error: true
         if: steps.restored-outputs.outputs.ready != 'true'
-        uses: $/.github/actions/csrc-l1-save
+        uses: ./.github/actions/csrc-l1-save
         with:
           cache-dir: ${{ env.INCREMENTAL_BUILD_CACHE_DIR }}
           primary-key: ${{ steps.incremental-cache-restore.outputs.primary-key }}

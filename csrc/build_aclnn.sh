@@ -124,7 +124,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "grouped_matmul_swiglu_quant"
         "grouped_matmul_swiglu_quant_v2"
         "chunk_fwd_o_vllm"
-        "kda_gate_cumsum"
+        # TEST-ONLY: exclude the separately known KDA build failure on A2.
         "kda_layout_swap12"
         "store_kv_block"
         "store_kv_block_metadata"

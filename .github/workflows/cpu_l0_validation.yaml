@@ -1,0 +1,142 @@
+# TEST-ONLY: invoke the real reusable CPU producer and real L0 transport.
+name: CPU L0 NPU handoff validation
+
+on:
+  push:
+    branches: [test/cpu-l0-handoff]
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.target.outputs.target }}
+      image: ${{ steps.target.outputs.image }}
+      image-tag: ${{ steps.target.outputs.image_tag }}
+      csrc-hash: ${{ steps.target.outputs.csrc_hash }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: target
+        name: Resolve canonical A2 target and exact source identity
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          import sys
+          sys.path.insert(0, '.github/workflows/scripts')
+          from resolve_csrc_cache_targets import resolve_targets
+          target = resolve_targets(['a2-arm64-ubuntu'])[0]
+          # TEST-ONLY: keep the canonical image/SOC, use an independent CPU pool.
+          target['runner'] = 'ubuntu-24.04-arm'
+          manifest = subprocess.check_output([
+              'git', 'ls-files', '-s', '--', 'csrc', 'setup.py', 'CMakeLists.txt', 'cmake'
+          ])
+          assert manifest.strip()
+          digest = hashlib.sha256(manifest).hexdigest()
+          # Isolate this test's L0 from both production and historical test caches.
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+              stream.write('target=' + json.dumps(target, separators=(',', ':')) + '\n')
+              stream.write('image=' + target['image'] + '\n')
+              stream.write('image_tag=' + target['image_tag'] + '\n')
+              stream.write('csrc_hash=cpu-l0-20261008-' + digest + '\n')
+          print(json.dumps(target, indent=2))
+          print('tracked_csrc_hash=' + digest)
+          PY
+          git rev-parse HEAD
+          sha256sum csrc/scripts/build_cache.py csrc/cmake/build_cache.cmake csrc/cmake/func.cmake
+
+  cpu-no-writer:
+    needs: resolve
+    uses: ./.github/workflows/_build_csrc_cache.yaml
+    with:
+      target: ${{ needs.resolve.outputs.target }}
+      csrc_hash: ${{ needs.resolve.outputs.csrc-hash }}
+      source_ref: ${{ github.sha }}
+    # Intentionally no secrets: absent OBS writer must not skip CPU compilation.
+
+  archive-consumer:
+    needs: [resolve, cpu-no-writer]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/csrc-l0-download
+        with:
+          architecture: ARM64
+          image-tag: ${{ needs.resolve.outputs.image-tag }}
+          csrc-hash: ${{ needs.resolve.outputs.csrc-hash }}
+      - name: Verify transported outputs without pretending to execute ARM code
+        run: |
+          python3 .github/workflows/scripts/csrc_l0_artifact.py verify --source-root .
+          find vllm_ascend -maxdepth 1 -name '*.so' -exec sha256sum '{}' \;
+          test ! -e csrc/build_cache
+
+  npu-consumer:
+    needs: [resolve, cpu-no-writer]
+    runs-on: linux-aarch64-a2b3-2
+    timeout-minutes: 45
+    container:
+      image: ${{ needs.resolve.outputs.image }}
+      options: >-
+        --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc
+        --device /dev/davinci0
+        -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
+    defaults:
+      run:
+        shell: bash
+    env:
+      UV_SYSTEM_PYTHON: '1'
+      UV_INDEX_URL: https://pypi.org/simple
+      UV_EXTRA_INDEX_URL: https://repo.huaweicloud.com/ascend/repos/pypi https://download.pytorch.org/whl/cpu
+      UV_INDEX_STRATEGY: unsafe-best-match
+      SOC_VERSION: ascend910b1
+      FLA_NPU_DISABLE_PTH: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Record NPU and source
+        run: |
+          npu-smi info
+          test "$(uname -m)" = aarch64
+          git rev-parse HEAD
+          sha256sum csrc/scripts/build_cache.py csrc/cmake/build_cache.cmake csrc/cmake/func.cmake
+      - uses: ./.github/actions/csrc-l0-download
+        with:
+          architecture: ARM64
+          image-tag: ${{ needs.resolve.outputs.image-tag }}
+          csrc-hash: ${{ needs.resolve.outputs.csrc-hash }}
+      - name: Arm native compile guards before installation
+        run: |
+          set -euo pipefail
+          for entry in csrc/build.sh csrc/build_aclnn.sh; do
+            printf '%s\n' '#!/bin/bash' 'echo "NPU csrc compile invoked" >&2' 'exit 97' > "$entry"
+          done
+          printf '%s\n' 'message(FATAL_ERROR "NPU CMake compile invoked")' > CMakeLists.txt
+          test ! -e csrc/build_cache
+      - name: Ordinary editable install without native compilation
+        run: |
+          set -euo pipefail
+          set +u
+          if ! source /usr/local/Ascend/ascend-toolkit/set_env.sh; then exit 1; fi
+          if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then
+            if ! source /usr/local/Ascend/nnal/atb/set_env.sh; then exit 1; fi
+          fi
+          set -u
+          pip install uv
+          uv pip install -r requirements-dev.txt
+          COMPILE_CUSTOM_KERNELS=0 uv pip install -e . --no-build-isolation --no-deps
+      - name: Execute CPU-produced custom operator on NPU
+        run: |
+          set -euo pipefail
+          set +u
+          if ! source /usr/local/Ascend/ascend-toolkit/set_env.sh; then exit 1; fi
+          if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then
+            if ! source /usr/local/Ascend/nnal/atb/set_env.sh; then exit 1; fi
+          fi
+          set -u
+          export ASCEND_CUSTOM_OPP_PATH="$GITHUB_WORKSPACE/vllm_ascend/_cann_ops_custom/vendors/customize"
+          python3 .github/workflows/scripts/cpu_l0_npu_smoke.py
+          test ! -e csrc/build_cache
