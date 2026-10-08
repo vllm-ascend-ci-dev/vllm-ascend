@@ -52,11 +52,6 @@ on:
         required: false
         default: ''
         description: 'Fixed base commit to rebase onto before building.'
-      continue_on_error:
-        type: boolean
-        required: false
-        default: false
-        description: 'Allow callers in rollout mode to continue when this cache build fails.'
     secrets:
       HW_OBS_AK:
         required: false
@@ -89,9 +84,6 @@ env:
 jobs:
   build:
     name: build-${{ fromJSON(inputs.target).id }}-cache
-    # Keep standalone cache builds fail-closed by default. The ensure workflow
-    # opts into tolerance only while NPU compilation remains the CI fallback.
-    continue-on-error: ${{ inputs.continue_on_error }}
     runs-on: ${{ fromJSON(inputs.target).runner }}
     env:
       OBS_CACHE_WRITE_ACCESS_KEY_ID: ${{ secrets.HW_OBS_AK }}
@@ -167,8 +159,39 @@ jobs:
           git submodule sync --recursive
           git submodule update --init --recursive
 
+      # Transport helpers belong to the workflow revision, not the selected
+      # source snapshot (which may be historical or from a fork).
+      - name: Checkout L0 transport helper
+        uses: actions/checkout@v7
+        with:
+          path: .csrc-cache-workflow
+          sparse-checkout: .github/workflows/scripts/csrc_l0_artifact.py
+          sparse-checkout-cone-mode: false
+
+      - name: Restore complete csrc cache
+        id: cache-csrc
+        continue-on-error: true
+        uses: runs-on/cache/restore@v5
+        with:
+          path: |
+            vllm_ascend/_cann_ops_custom
+            vllm_ascend/*.so
+            vllm_ascend/lib
+            vllm_ascend/include
+          key: vllm-ascend-build-v2-${{ fromJSON(inputs.target).cache_arch }}-${{ fromJSON(inputs.target).image_tag }}-${{ inputs.csrc_hash }}
+
+      - name: Check restored csrc outputs
+        id: restored-outputs
+        if: steps.cache-csrc.outputs.cache-hit == 'true'
+        run: |
+          if python3 .csrc-cache-workflow/.github/workflows/scripts/csrc_l0_artifact.py verify --source-root .; then
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          else
+            echo '::warning::Incomplete shared L0; rebuild on the CPU producer.'
+          fi
+
       - name: Install system dependencies (ubuntu)
-        if: fromJSON(inputs.target).os == 'ubuntu'
+        if: steps.restored-outputs.outputs.ready != 'true' && fromJSON(inputs.target).os == 'ubuntu'
         run: |
           xargs apt-get -y install < packages.txt
           apt-get -y install gcc g++ cmake libnuma-dev clang-15
@@ -177,13 +200,15 @@ jobs:
           pip install uv
 
       - name: Install system dependencies (openeuler)
-        if: fromJSON(inputs.target).os == 'openeuler'
+        if: steps.restored-outputs.outputs.ready != 'true' && fromJSON(inputs.target).os == 'openeuler'
         run: |
           yum install -y python3-pip net-tools jemalloc numactl patch clang
           pip install uv
 
       - name: Restore incremental build cache
         id: incremental-cache-restore
+        continue-on-error: true
+        if: steps.restored-outputs.outputs.ready != 'true'
         uses: $/.github/actions/csrc-l1-restore
         with:
           cache-dir: ${{ env.INCREMENTAL_BUILD_CACHE_DIR }}
@@ -192,17 +217,29 @@ jobs:
           csrc-hash: ${{ inputs.csrc_hash }}
 
       - name: Install vllm-ascend
+        if: steps.restored-outputs.outputs.ready != 'true'
         env:
           SOC_VERSION: ${{ fromJSON(inputs.target).soc_version }}
           MAX_JOBS: '16'
+          TORCH_DEVICE_BACKEND_AUTOLOAD: '0'
           VLLM_ASCEND_BUILD_CACHE_DIR: ${{ env.INCREMENTAL_BUILD_CACHE_DIR }}
+          VLLM_ASCEND_BUILD_CACHE_EVENT_LOG: ${{ runner.temp }}/csrc-cpu-build.jsonl
         run: |
           mkdir -p "$VLLM_ASCEND_BUILD_CACHE_DIR"
           rm -f "$VLLM_ASCEND_BUILD_CACHE_EVENT_LOG"
           touch "$VLLM_ASCEND_BUILD_CACHE_EVENT_LOG"
 
-          source /usr/local/Ascend/ascend-toolkit/set_env.sh
-          source /usr/local/Ascend/nnal/atb/set_env.sh
+          # Vendor scripts probe optional driver metadata on CPU builders.
+          # A conditional source avoids errexit on those internal probes while
+          # still failing if environment setup itself returns an error.
+          if ! source /usr/local/Ascend/ascend-toolkit/set_env.sh; then
+            echo '::error::CANN environment setup failed.'
+            exit 1
+          fi
+          if ! source /usr/local/Ascend/nnal/atb/set_env.sh; then
+            echo '::error::ATB environment setup failed.'
+            exit 1
+          fi
           arch=$(uname -i)
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/${arch}-linux/devlib
 
@@ -218,15 +255,28 @@ jobs:
           uv pip install -e .
 
       - name: Verify csrc artifacts
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/csrc-l0-upload
         run: |
-          if ! find vllm_ascend -maxdepth 1 -name '*.so' -type f 2>/dev/null | grep -q .; then
-            echo "::error::The csrc build does not contain a top-level shared library."
-            exit 1
-          fi
+          python3 .csrc-cache-workflow/.github/workflows/scripts/csrc_l0_artifact.py pack \
+            --source-root . --artifact-dir "$ARTIFACT_DIR"
+
+      # Same-run transport is mandatory, including PRs without OBS secrets.
+      # Shared persistence is optional and cannot send compilation to NPU jobs.
+      - name: Upload complete csrc artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: vllm-ascend-build-v2-${{ fromJSON(inputs.target).cache_arch }}-${{ fromJSON(inputs.target).image_tag }}-${{ inputs.csrc_hash }}
+          path: ${{ runner.temp }}/csrc-l0-upload/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
 
       # L1 transport failure is a performance degradation, not a correctness
       # failure. The verified final L0 artifact can still be published.
       - name: Save incremental build cache
+        continue-on-error: true
+        if: steps.restored-outputs.outputs.ready != 'true'
         uses: $/.github/actions/csrc-l1-save
         with:
           cache-dir: ${{ env.INCREMENTAL_BUILD_CACHE_DIR }}
@@ -235,8 +285,10 @@ jobs:
           secret-access-key: ${{ env.OBS_CACHE_WRITE_SECRET_ACCESS_KEY }}
 
       - name: Save csrc cache
+        continue-on-error: true
         if: >-
           ${{
+            steps.restored-outputs.outputs.ready != 'true' &&
             env.OBS_CACHE_WRITE_ACCESS_KEY_ID != '' &&
             env.OBS_CACHE_WRITE_SECRET_ACCESS_KEY != ''
           }}

@@ -89,13 +89,6 @@ jobs:
       matrix:
         group: ${{ fromJSON(inputs.test_groups) }}
     runs-on: ${{ matrix.group.runner }}
-    env:
-      RUNS_ON_S3_BUCKET_CACHE: ascend-ci-cache-hk
-      RUNS_ON_S3_BUCKET_ENDPOINT: https://obs.ap-southeast-1.myhuaweicloud.com
-      RUNS_ON_S3_FORCE_PATH_STYLE: "false"
-      AWS_S3_FORCE_PATH_STYLE: "false"
-      AWS_REGION: ap-southeast-1
-      RUNS_ON_RUNNER_NAME: ""
     container:
       image: swr.cn-north-12.myhuaweicloud.com/atlas_inference/cann:${{ matrix.group.image_tag }}
       env:
@@ -196,31 +189,22 @@ jobs:
             *) echo "arch=$ARCH" >> "$GITHUB_OUTPUT" ;;
           esac
 
-      - name: Restore vllm-ascend csrc cache
-        id: cache-csrc
+      - name: Checkout L0 transport helpers
         if: ${{ matrix.group.npu_type != 'cpu' }}
-        uses: runs-on/cache/restore@v5
+        uses: actions/checkout@v7
         with:
-          path: |
-            vllm_ascend/_cann_ops_custom
-            vllm_ascend/*.so
-            vllm_ascend/lib
-            vllm_ascend/include
-          key: vllm-ascend-build-v2-${{ steps.get_arch.outputs.arch }}-${{ matrix.group.image_tag }}-${{ steps.get_csrc_hash.outputs.CSRC_HASH }}
-          # During the rollout, tolerate misses so CI can fall back to the
-          # existing NPU build while CPU cache production proves stable.
-          # Restore fail-on-cache-miss to true after the transition period.
-          fail-on-cache-miss: false
+          path: .csrc-cache-workflow
+          sparse-checkout: |
+            .github/actions/csrc-l0-download
+            .github/workflows/scripts/csrc_l0_artifact.py
+          sparse-checkout-cone-mode: false
 
-      - name: Restore incremental cache
-        id: fallback-l1
-        if: ${{ matrix.group.npu_type != 'cpu' && steps.cache-csrc.outputs.cache-hit != 'true' }}
-        uses: $/.github/actions/csrc-l1-restore
+      - name: Download complete CPU-produced csrc artifact
+        if: ${{ matrix.group.npu_type != 'cpu' }}
+        uses: ./.csrc-cache-workflow/.github/actions/csrc-l0-download
         with:
-          cache-dir: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
           architecture: ${{ steps.get_arch.outputs.arch }}
-          soc-version: ${{ matrix.group.npu_type }}
-          source-root: .
+          image-tag: ${{ matrix.group.image_tag }}
           csrc-hash: ${{ steps.get_csrc_hash.outputs.CSRC_HASH }}
 
       - name: Install Mooncake wheel
@@ -244,21 +228,15 @@ jobs:
       - name: Install vllm-project/vllm-ascend with device
         if: ${{ matrix.group.npu_type != 'cpu' }}
         env:
-          CSRC_CACHE_HIT: ${{ steps.cache-csrc.outputs.cache-hit }}
+          COMPILE_CUSTOM_KERNELS: '0'
         run: |
           export MAX_JOBS=$(( ${{ matrix.group.num_npus }} * 23 ))
           pip install uc-manager
           uv pip install -r requirements-dev.txt
           uv pip install --force-reinstall --no-deps triton-ascend==3.2.2
-          # Preserve CI availability during the transition by compiling on the
-          # NPU only when the new CPU-produced cache is unavailable.
-          if [ "$CSRC_CACHE_HIT" = "true" ]; then
-            echo "csrc cache hit: skip kernel compilation"
-            COMPILE_CUSTOM_KERNELS=0 uv pip install -e .
-          else
-            echo "csrc cache miss: compile kernels on the NPU runner"
-            uv pip install -e . --no-build-isolation
-          fi
+          # A missing/corrupt L0 fails in the download step; native compilation
+          # belongs to the CPU producer, never a consumer fallback.
+          uv pip install -e .
 
       - name: Install FLA NPU for selected tests
         if: ${{ matrix.group.npu_type == 'a2' || matrix.group.npu_type == 'a3' || matrix.group.npu_type == 'a5' }}

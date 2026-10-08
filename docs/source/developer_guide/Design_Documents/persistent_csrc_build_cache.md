@@ -24,6 +24,13 @@ ordinary source build
 The source build remains authoritative. L1 only replaces an equivalent action
 with previously verified artifacts.
 
+For selected NPU tests, compilation belongs to the CPU producer. The producer
+first tries the exact L0; on a miss it restores optional L1 and builds on CPU.
+It uploads the complete L0 as a same-run artifact before optional OBS saves.
+NPU consumers download and verify that artifact and install with
+`COMPILE_CUSTOM_KERNELS=0`. A missing artifact is a producer/transport failure,
+not permission to compile on NPU.
+
 ## Goals and non-goals
 
 Goals:
@@ -328,9 +335,10 @@ export, or save persistent L1.
 
 Source-consuming jobs are read-only L1 consumers: they may restore a compatible
 snapshot before their existing source installation, but they do not publish.
-Exact-artifact consumers use the central L0 output; an L0 miss continues to the
-ordinary source build without making persistent L1 transport a prerequisite.
-Local compilation remains correct but does not create a shared snapshot.
+Selected-test consumers use the central producer's same-run L0 and do not
+access OBS or L1. The CPU producer runs even without OBS writer credentials;
+those credentials control only cross-run publication. Other direct-source
+and historical workflows retain their existing source-build policy.
 
 A writer publishes only after a successful build creates or replaces a local
 entry. OBS restore and save failures remain performance degradations.
@@ -348,6 +356,8 @@ entry. OBS restore and save failures remain performance degradations.
 | Local entry save fails | Warn and keep the successful build output. |
 | Snapshot save fails | Keep the successful build or verified L0 artifact. |
 | Compiler command fails | Fail the build. |
+| CPU producer fails | Its dependent selected NPU consumers do not run. |
+| Same-run L0 is missing, corrupt, or incomplete | Fail the consumer before installation; never compile on NPU. |
 | Artifact ownership collides | Fail rather than overwrite another action's output. |
 | Action or publish synchronization fails | Fail when continuing could corrupt shared output. |
 
@@ -362,9 +372,11 @@ Source-consuming jobs restore L1 before their existing source installation and
 do not publish. Exact-artifact jobs use the canonical producer's L0 output; an
 L0 miss proceeds through their existing source build without a second direct
 L1 fallback, except where a caller explicitly enables the optional shared-L1
-fallback. Selected-test jobs use that optional fallback after an L0 miss;
-other L0 consumers, including scheduled upstream E2E, retain their caller-
-specific source-build policy.
+fallback. Selected-test jobs instead require the CPU-produced same-run L0
+artifact, with no L1 restore or native compilation fallback. Other L0
+consumers, including scheduled upstream E2E, retain their caller-specific
+source-build policy; converting them requires matching their target images
+and explicit producer dependencies.
 
 ### Local source builds
 
@@ -378,9 +390,20 @@ it does not change the compiled source or CI's persistent snapshot.
 
 ### Central producer
 
-The reusable producer restores L1, performs the ordinary source build, verifies
-final native artifacts, publishes changed L1 state, and then publishes the
-exact L0 artifact.
+The reusable producer downloads an exact shared L0 when available. Otherwise
+it restores optional L1, performs the ordinary source build on CPU, and
+verifies final native artifacts. In both cases it uploads the complete L0
+for current-run consumers. After a build, trusted writers may additionally
+publish changed L1 state and shared L0; either publication may fail without
+invalidating the verified same-run artifact.
+
+The same-run artifact name matches the existing L0 key: architecture, exact
+CANN/OS/Python image tag, and tracked csrc hash. The canonical target table
+must match consumer images. A tar archive preserves modes and symlinks that
+GitHub artifact transport would otherwise lose. The transport helper checks
+the checksum, restricts extraction to native output paths, and verifies the
+incoming artifact in a fresh directory before copying into the source tree.
+It does not package the Python source or `csrc/build_cache`.
 
 ### Historical sources
 
@@ -429,3 +452,6 @@ operator namespace. For historical source, check the restore action's
 | Persistent restore and key orchestration | `.github/actions/csrc-l1-restore/action.yaml` |
 | Persistent changed-snapshot publication | `.github/actions/csrc-l1-save/action.yaml` |
 | Central producer | `.github/workflows/_build_csrc_cache.yaml` |
+| CPU target coordination | `.github/workflows/_ensure_csrc_cache.yaml` |
+| Complete L0 packing and verification | `.github/workflows/scripts/csrc_l0_artifact.py` |
+| Same-run L0 consumer transport | `.github/actions/csrc-l0-download/action.yaml` |

@@ -69,9 +69,6 @@ env:
 jobs:
   prepare-cache-checks:
     name: Prepare csrc cache checks
-    # During rollout, cache preparation is observational and must not block the
-    # existing NPU build path. Remove this tolerance once CPU caching is stable.
-    continue-on-error: true
     runs-on: linux-amd64-cpu-2-hk
     container:
       image: quay.io/ascend-ci/vllm-ascend:lint
@@ -79,9 +76,6 @@ jobs:
       targets: ${{ steps.targets.outputs.targets }}
       has_targets: ${{ steps.targets.outputs.has_targets }}
       csrc_hash: ${{ steps.hash.outputs.csrc_hash }}
-      missing_targets: ${{ steps.misses.outputs.missing_targets }}
-      has_missing: ${{ steps.misses.outputs.has_missing }}
-      has_write_credentials: ${{ steps.writer-credentials.outputs.present }}
     steps:
       - name: Install csrc cache dependencies
         run: |
@@ -168,137 +162,16 @@ jobs:
           python3 .csrc-cache-workflow/.github/workflows/scripts/resolve_csrc_cache_targets.py \
             --target-ids "$TARGET_IDS"
 
-      - name: Detect OBS writer credentials
-        id: writer-credentials
-        env:
-          HW_OBS_AK: ${{ secrets.HW_OBS_AK }}
-          HW_OBS_SK: ${{ secrets.HW_OBS_SK }}
-        run: |
-          if [ -n "$HW_OBS_AK" ] && [ -n "$HW_OBS_SK" ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # This coordinator only needs to know whether a cache exists; downloading
-      # large artifacts here would add latency before the actual consumer jobs.
-      - name: Look up csrc cache (a2-arm64-ubuntu)
-        id: lookup-a2
-        if: contains(fromJSON(inputs.target_ids), 'a2-arm64-ubuntu')
-        uses: runs-on/cache/restore@v5
-        with:
-          path: |
-            vllm_ascend/_cann_ops_custom
-            vllm_ascend/*.so
-            vllm_ascend/lib
-            vllm_ascend/include
-          key: vllm-ascend-build-v2-ARM64-9.2.0_20260928212200-910b-ubuntu22.04-py3.12-${{ steps.hash.outputs.csrc_hash }}
-          lookup-only: 'true'
-
-      - name: Look up csrc cache (a3-arm64-ubuntu)
-        id: lookup-a3
-        if: contains(fromJSON(inputs.target_ids), 'a3-arm64-ubuntu')
-        uses: runs-on/cache/restore@v5
-        with:
-          path: |
-            vllm_ascend/_cann_ops_custom
-            vllm_ascend/*.so
-            vllm_ascend/lib
-            vllm_ascend/include
-          key: vllm-ascend-build-v2-ARM64-9.2.0_20260928212200-a3-ubuntu22.04-py3.12-${{ steps.hash.outputs.csrc_hash }}
-          lookup-only: 'true'
-
-      - name: Look up csrc cache (310p-arm64-ubuntu)
-        id: lookup-310p
-        if: contains(fromJSON(inputs.target_ids), '310p-arm64-ubuntu')
-        uses: runs-on/cache/restore@v5
-        with:
-          path: |
-            vllm_ascend/_cann_ops_custom
-            vllm_ascend/*.so
-            vllm_ascend/lib
-            vllm_ascend/include
-          key: vllm-ascend-build-v2-ARM64-9.2.0_20260928212200-310p-ubuntu22.04-py3.12-${{ steps.hash.outputs.csrc_hash }}
-          lookup-only: 'true'
-
-      - name: Look up csrc cache (a5-arm64-ubuntu)
-        id: lookup-a5
-        if: contains(fromJSON(inputs.target_ids), 'a5-arm64-ubuntu')
-        uses: runs-on/cache/restore@v5
-        with:
-          path: |
-            vllm_ascend/_cann_ops_custom
-            vllm_ascend/*.so
-            vllm_ascend/lib
-            vllm_ascend/include
-          key: vllm-ascend-build-v2-ARM64-9.1.0-950-ubuntu22.04-py3.12-${{ steps.hash.outputs.csrc_hash }}
-          lookup-only: 'true'
-
-      - name: Summarize csrc cache results
-        id: misses
-        env:
-          A2_CACHE_HIT: ${{ steps.lookup-a2.outputs.cache-hit }}
-          A3_CACHE_HIT: ${{ steps.lookup-a3.outputs.cache-hit }}
-          P310_CACHE_HIT: ${{ steps.lookup-310p.outputs.cache-hit }}
-          A5_CACHE_HIT: ${{ steps.lookup-a5.outputs.cache-hit }}
-          TARGETS: ${{ steps.targets.outputs.targets }}
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-
-          cache_hits = {
-              "a2-arm64-ubuntu": os.environ["A2_CACHE_HIT"] == "true",
-              "a3-arm64-ubuntu": os.environ["A3_CACHE_HIT"] == "true",
-              "310p-arm64-ubuntu": os.environ["P310_CACHE_HIT"] == "true",
-              "a5-arm64-ubuntu": os.environ["A5_CACHE_HIT"] == "true",
-          }
-          targets = json.loads(os.environ["TARGETS"])
-          # Lookup steps are intentionally explicit. Fail when configuration
-          # expands before this workflow is taught how to check the new target.
-          unsupported = sorted(
-              target["id"]
-              for target in targets
-              if target["id"] not in cache_hits
-          )
-          if unsupported:
-              print(
-                  "::error::Unsupported csrc cache targets: "
-                  + ", ".join(unsupported)
-              )
-              raise SystemExit(1)
-
-          missing = [
-              target
-              for target in targets
-              if not cache_hits[target["id"]]
-          ]
-
-          print("csrc cache lookup results:")
-          for target in targets:
-              cache_hit = cache_hits[target["id"]]
-              print(f"- {target['id']}: {'hit' if cache_hit else 'miss'}")
-          if not targets:
-              print("- no csrc cache targets requested")
-
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              print(
-                  "missing_targets=" + json.dumps(missing, separators=(",", ":")),
-                  file=output,
-              )
-              print(f"has_missing={str(bool(missing)).lower()}", file=output)
-          PY
-
-  build-missing-caches:
-    name: Build csrc cache (${{ matrix.target.id }})
+  prepare-l0-artifacts:
+    name: Prepare complete csrc artifact (${{ matrix.target.id }})
     needs: prepare-cache-checks
-    if: >-
-      needs.prepare-cache-checks.outputs.has_missing == 'true' &&
-      needs.prepare-cache-checks.outputs.has_write_credentials == 'true'
+    # Every requested target must expose a same-run L0, including a shared
+    # L0 hit. Credentials affect shared publication, not CPU build capability.
+    if: needs.prepare-cache-checks.outputs.has_targets == 'true'
     strategy:
       fail-fast: false
       matrix:
-        target: ${{ fromJSON(needs.prepare-cache-checks.outputs.missing_targets) }}
+        target: ${{ fromJSON(needs.prepare-cache-checks.outputs.targets) }}
     uses: ./.github/workflows/_build_csrc_cache.yaml
     secrets:
       HW_OBS_AK: ${{ secrets.HW_OBS_AK }}
@@ -311,6 +184,3 @@ jobs:
       base_repository: ${{ inputs.base_repository }}
       base_ref: ${{ inputs.base_ref }}
       base_sha: ${{ inputs.base_sha }}
-      # Preserve CI during rollout if a missing cache cannot yet be built on CPU.
-      # The standalone push workflow keeps the build workflow's default false.
-      continue_on_error: true

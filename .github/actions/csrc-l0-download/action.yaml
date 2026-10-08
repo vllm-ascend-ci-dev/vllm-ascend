@@ -1,0 +1,33 @@
+name: Download complete csrc L0
+description: Consume a CPU-produced artifact from this workflow without OBS credentials or native compilation.
+inputs:
+  architecture:
+    required: true
+    description: The target architecture used by the CPU producer.
+  image-tag:
+    required: true
+    description: The exact target CANN/OS/Python image tag.
+  csrc-hash:
+    required: true
+    description: The tracked csrc input hash used by the CPU producer.
+  source-root:
+    required: false
+    default: '.'
+    description: The source checkout receiving complete csrc outputs.
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@v8
+      with:
+        name: vllm-ascend-build-v2-${{ inputs.architecture }}-${{ inputs.image-tag }}-${{ inputs.csrc-hash }}
+        path: ${{ runner.temp }}/csrc-l0-download
+    - name: Verify and restore complete L0
+      shell: bash
+      env:
+        SOURCE_ROOT: ${{ inputs.source-root }}
+        ARTIFACT_DIR: ${{ runner.temp }}/csrc-l0-download
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        python3 "$ACTION_PATH/../../workflows/scripts/csrc_l0_artifact.py" unpack \
+          --source-root "$SOURCE_ROOT" --artifact-dir "$ARTIFACT_DIR"

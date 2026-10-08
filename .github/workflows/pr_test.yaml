@@ -568,10 +568,12 @@ jobs:
             echo "test_groups=[]"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Add upstream test cache target
+      - name: Collect consumer cache targets
         id: cache-targets
         env:
           SELECTED_TARGET_IDS: ${{ steps.scope-rec.outputs.csrc_cache_target_ids || steps.scope-all.outputs.csrc_cache_target_ids || steps.noop.outputs.csrc_cache_target_ids }}
+          A5_TARGET_IDS: ${{ steps.scope-a5.outputs.csrc_cache_target_ids || '[]' }}
+          RUN_A5: ${{ contains(github.event.pull_request.labels.*.name, 'ready-a5') }}
         run: |
           python3 - <<'PY'
           import json
@@ -579,6 +581,8 @@ jobs:
 
           target_ids = json.loads(os.environ["SELECTED_TARGET_IDS"])
           target_ids = sorted(set(target_ids) | {"a2-arm64-ubuntu"})
+          if os.environ["RUN_A5"] == "true":
+              target_ids = sorted(set(target_ids) | set(json.loads(os.environ["A5_TARGET_IDS"])))
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               print("target_ids=" + json.dumps(target_ids, separators=(",", ":")), file=output)
           PY
@@ -675,7 +679,7 @@ jobs:
       test_groups: ${{ needs.select-tests.outputs.test_groups }}
 
   run-selected-tests-a5:
-    needs: [pre-commit, select-tests]
+    needs: [pre-commit, select-tests, prepare-csrc-cache]
     # !cancelled() overrides transitive skip-propagation from recommend-tests
     # (skipped under ready-all) through select-tests, without running after workflow cancel.
     if: >-
@@ -683,6 +687,7 @@ jobs:
         !cancelled() &&
         needs.pre-commit.result == 'success' &&
         needs.select-tests.result == 'success' &&
+        needs.prepare-csrc-cache.result == 'success' &&
         needs.select-tests.outputs.has_tests_a5 == 'true' &&
         contains(github.event.pull_request.labels.*.name, 'ready-a5')
       }}
@@ -699,6 +704,7 @@ jobs:
       ref: ${{ github.event.pull_request.head.sha }}
       base_ref: ${{ github.base_ref }}
       test_groups: ${{ needs.select-tests.outputs.test_groups_a5 }}
+      base_sha: ${{ needs.select-tests.outputs.base_sha }}
 
   # Summary gate job — use this single, stable name as the required status check
   # in GitHub branch protection rules instead of tracking individual matrix job names.
