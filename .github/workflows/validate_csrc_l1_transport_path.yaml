@@ -34,6 +34,7 @@ jobs:
               -e "s#https://obs.ap-southeast-1.myhuaweicloud.com#$TEST_OBS_ENDPOINT#g" \
               -e "s/ap-southeast-1/$TEST_OBS_REGION/g" "$action"
           done
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git log -2 --oneline
           git rev-parse HEAD:csrc/scripts/build_cache.py HEAD:csrc/cmake/build_cache.cmake
       - name: Restore isolated cold namespace
@@ -104,6 +105,9 @@ jobs:
   fail-open:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      AWS_ACCESS_KEY_ID: test-only-invalid-key
+      AWS_SECRET_ACCESS_KEY: test-only-invalid-secret
     steps:
       - uses: actions/checkout@v7
       - name: Inject unreachable cache backend
