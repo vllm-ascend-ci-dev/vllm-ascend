@@ -1,0 +1,139 @@
+# TEST-ONLY: verify the production fix with private TEST OBS, not production OBS.
+name: Validate L1 relative transport path
+on:
+  push:
+    branches: [test/csrc-l1-transport-path]
+permissions:
+  contents: read
+env:
+  TEST_OBS_BUCKET: obs-guiiyang1-ascend-test
+  TEST_OBS_ENDPOINT: https://obs.cn-southwest-2.myhuaweicloud.com
+  TEST_OBS_REGION: cn-southwest-2
+  TEST_TOOLCHAIN_IMAGE: "transport-fixture:${{ github.run_id }}-${{ github.run_attempt }}"
+  TEST_CSRC_HASH: "transport-source-${{ github.run_id }}-${{ github.run_attempt }}"
+jobs:
+  producer:
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    timeout-minutes: 10
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.OBS_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_KEY }}
+    outputs:
+      key: ${{ steps.restore.outputs.primary-key }}
+      cache-path: ${{ steps.paths.outputs.cache-path }}
+    steps:
+      - name: Install bootstrap dependencies
+        run: apt-get update -qq && apt-get install -y -qq python3 git zstd
+      - uses: actions/checkout@v7
+      - name: Select private TEST OBS
+        run: |
+          test -n "$AWS_ACCESS_KEY_ID" && test -n "$AWS_SECRET_ACCESS_KEY"
+          for action in .github/actions/csrc-l1-restore/action.yaml .github/actions/csrc-l1-save/action.yaml; do
+            sed -i -e "s/ascend-ci-cache-hk/$TEST_OBS_BUCKET/g" \
+              -e "s#https://obs.ap-southeast-1.myhuaweicloud.com#$TEST_OBS_ENDPOINT#g" \
+              -e "s/ap-southeast-1/$TEST_OBS_REGION/g" "$action"
+          done
+          git log -2 --oneline
+          git rev-parse HEAD:csrc/scripts/build_cache.py HEAD:csrc/cmake/build_cache.cmake
+      - name: Restore isolated cold namespace
+        id: restore
+        uses: ./.github/actions/csrc-l1-restore
+        with:
+          cache-dir: csrc/build_cache
+          architecture: x64
+          soc-version: a2
+          toolchain-image: ${{ env.TEST_TOOLCHAIN_IMAGE }}
+          csrc-hash: ${{ env.TEST_CSRC_HASH }}
+      - name: Verify cold actions and absolute runtime path
+        id: paths
+        env:
+          SUPPORTED: ${{ steps.restore.outputs.supported }}
+          MATCHED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          test "$SUPPORTED" = true
+          test -z "$MATCHED_KEY"
+          python3 .github/workflows/scripts/validate_l1_transport_fixture.py cold
+          echo "cache-path=$VLLM_ASCEND_BUILD_CACHE_DIR" >> "$GITHUB_OUTPUT"
+      - name: Save cold L1 to TEST OBS
+        uses: ./.github/actions/csrc-l1-save
+        with:
+          cache-dir: csrc/build_cache
+          primary-key: ${{ steps.restore.outputs.primary-key }}
+          access-key-id: ${{ secrets.OBS_ACCESS_KEY }}
+          secret-access-key: ${{ secrets.OBS_SECRET_KEY }}
+  consumers:
+    needs: producer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        restore: [same-csrc, compatibility]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.OBS_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select private TEST OBS
+        run: |
+          sed -i -e "s/ascend-ci-cache-hk/$TEST_OBS_BUCKET/g" \
+            -e "s#https://obs.ap-southeast-1.myhuaweicloud.com#$TEST_OBS_ENDPOINT#g" \
+            -e "s/ap-southeast-1/$TEST_OBS_REGION/g" .github/actions/csrc-l1-restore/action.yaml
+      - name: Restore from the independent producer
+        id: restore
+        uses: ./.github/actions/csrc-l1-restore
+        with:
+          cache-dir: csrc/build_cache
+          architecture: x64
+          soc-version: a2
+          toolchain-image: ${{ env.TEST_TOOLCHAIN_IMAGE }}
+          csrc-hash: ${{ matrix.restore == 'same-csrc' && env.TEST_CSRC_HASH || format('{0}-mutation', env.TEST_CSRC_HASH) }}
+      - name: Verify cross-workspace archive placement and inner HIT
+        env:
+          EXPECTED_KEY: ${{ needs.producer.outputs.key }}
+          PRODUCER_CACHE: ${{ needs.producer.outputs.cache-path }}
+          MATCHED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          test -n "$MATCHED_KEY"
+          test "$MATCHED_KEY" = "$EXPECTED_KEY"
+          test "$PRODUCER_CACHE" != "$VLLM_ASCEND_BUILD_CACHE_DIR"
+          test ! -e "$PRODUCER_CACHE"
+          python3 .github/workflows/scripts/validate_l1_transport_fixture.py warm
+          echo "matched=$MATCHED_KEY"
+  fail-open:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Inject unreachable cache backend
+        run: |
+          sed -i 's#https://obs.ap-southeast-1.myhuaweicloud.com#http://127.0.0.1:9#g' \
+            .github/actions/csrc-l1-restore/action.yaml .github/actions/csrc-l1-save/action.yaml
+      - name: Restore transport failure must not fail the action
+        id: restore
+        uses: ./.github/actions/csrc-l1-restore
+        with:
+          cache-dir: csrc/build_cache
+          architecture: x64
+          soc-version: a2
+          toolchain-image: ${{ env.TEST_TOOLCHAIN_IMAGE }}
+          csrc-hash: ${{ env.TEST_CSRC_HASH }}
+      - name: Ordinary build after restore failure
+        env:
+          SUPPORTED: ${{ steps.restore.outputs.supported }}
+          MATCHED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          test "$SUPPORTED" = true
+          test -z "$MATCHED_KEY"
+          python3 .github/workflows/scripts/validate_l1_transport_fixture.py cold
+      - name: Save transport failure must not fail the action
+        uses: ./.github/actions/csrc-l1-save
+        with:
+          cache-dir: csrc/build_cache
+          primary-key: ${{ steps.restore.outputs.primary-key }}
+          access-key-id: test-only-invalid-key
+          secret-access-key: test-only-invalid-secret
+      - name: Main workflow still proceeds
+        run: echo "ordinary build completed; failed restore/save did not block the workflow"
+
