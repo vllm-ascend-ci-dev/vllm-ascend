@@ -132,6 +132,9 @@ jobs:
   restore-failure:
     runs-on: ubuntu-24.04
     timeout-minutes: 8
+    env:
+      AWS_ACCESS_KEY_ID: test-invalid-key
+      AWS_SECRET_ACCESS_KEY: test-invalid-secret
     steps:
       - uses: actions/checkout@v7
       - name: Inject unreachable test transport
