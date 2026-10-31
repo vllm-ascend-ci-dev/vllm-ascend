@@ -1,0 +1,162 @@
+# TEST-ONLY: CPU fixtures and real cache services; no NPU/image publication.
+name: Validate minimal nightly L0 and L1
+on:
+  push:
+    branches: [test/nightly-l0-minimal]
+permissions:
+  contents: read
+env:
+  TEST_L0_KEY: nightly-l0-validation-${{ github.run_id }}-${{ github.run_attempt }}
+  TEST_TOOLCHAIN: nightly-fixture:${{ github.run_id }}-${{ github.run_attempt }}
+  TEST_SOURCE: nightly-fixture-source-${{ github.run_id }}-${{ github.run_attempt }}
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          python3 -m pip install pytest pyyaml
+          python3 -m pytest -q --confcutdir=tests/ut/_tools \
+            tests/ut/_tools/test_nightly_csrc_l0.py tests/ut/_tools/test_prepare_csrc_l1_restore.py
+          git rev-parse HEAD
+          sha256sum .github/workflows/_ensure_csrc_cache.yaml .github/workflows/_build_csrc_cache.yaml
+  cold-l1:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.OBS_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_KEY }}
+    outputs:
+      key: ${{ steps.restore.outputs.primary-key }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select existing TEST OBS backend
+        run: |
+          python3 .github/workflows/scripts/select_nightly_test_backend.py
+          test -n "$AWS_ACCESS_KEY_ID" && test -n "$AWS_SECRET_ACCESS_KEY"
+      - id: restore
+        uses: ./.github/actions/csrc-l1-restore
+        with:
+          cache-dir: csrc/build_cache
+          architecture: x64
+          soc-version: a2
+          toolchain-image: ${{ env.TEST_TOOLCHAIN }}
+          csrc-hash: ${{ env.TEST_SOURCE }}
+      - name: Actual cold compile
+        env:
+          SUPPORTED: ${{ steps.restore.outputs.supported }}
+          MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          test "$SUPPORTED" = true
+          test -z "$MATCHED"
+          python3 .github/workflows/scripts/validate_nightly_cache_transport.py cold
+      - uses: ./.github/actions/csrc-l1-save
+        with:
+          cache-dir: csrc/build_cache
+          primary-key: ${{ steps.restore.outputs.primary-key }}
+          access-key-id: ${{ secrets.OBS_ACCESS_KEY }}
+          secret-access-key: ${{ secrets.OBS_SECRET_KEY }}
+  warm-producer:
+    needs: cold-l1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.OBS_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.OBS_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select existing TEST OBS backend
+        run: python3 .github/workflows/scripts/select_nightly_test_backend.py
+      - id: l0
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            vllm_ascend/_cann_ops_custom
+            vllm_ascend/*.so
+            vllm_ascend/lib
+            vllm_ascend/include
+            .nightly-csrc-l0.json
+          key: ${{ env.TEST_L0_KEY }}
+      - id: restore
+        uses: ./.github/actions/csrc-l1-restore
+        with:
+          cache-dir: csrc/build_cache
+          architecture: x64
+          soc-version: a2
+          toolchain-image: ${{ env.TEST_TOOLCHAIN }}
+          csrc-hash: ${{ env.TEST_SOURCE }}-compatible-source-change
+      - name: L0 miss plus compatible L1; compiler is forbidden
+        env:
+          L0_HIT: ${{ steps.l0.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
+          EXPECTED: ${{ needs.cold-l1.outputs.key }}
+        run: |
+          test "$L0_HIT" != true
+          test -n "$MATCHED"
+          test "$MATCHED" = "$EXPECTED"
+          python3 .github/workflows/scripts/validate_nightly_cache_transport.py warm
+      - uses: actions/cache/save@v4
+        with:
+          path: |
+            vllm_ascend/_cann_ops_custom
+            vllm_ascend/*.so
+            vllm_ascend/lib
+            vllm_ascend/include
+            .nightly-csrc-l0.json
+          key: ${{ env.TEST_L0_KEY }}
+  l0-consumer:
+    needs: warm-producer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v7
+      - id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            vllm_ascend/_cann_ops_custom
+            vllm_ascend/*.so
+            vllm_ascend/lib
+            vllm_ascend/include
+            .nightly-csrc-l0.json
+          key: ${{ env.TEST_L0_KEY }}
+      - name: Validate and execute the binary without compiling
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+        run: |
+          test "$HIT" = true
+          python3 .github/workflows/scripts/validate_nightly_cache_transport.py consume
+      - name: Reject changed binary bytes
+        run: python3 .github/workflows/scripts/validate_nightly_cache_transport.py reject
+  restore-failure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v7
+      - name: Inject unreachable test transport
+        run: |
+          sed -i 's#https://obs.ap-southeast-1.myhuaweicloud.com#http://127.0.0.1:9#g' \
+            .github/actions/csrc-l1-restore/action.yaml .github/actions/csrc-l1-save/action.yaml
+      - id: restore
+        uses: ./.github/actions/csrc-l1-restore
+        with:
+          cache-dir: csrc/build_cache
+          architecture: x64
+          soc-version: a2
+          toolchain-image: ${{ env.TEST_TOOLCHAIN }}
+          csrc-hash: ${{ env.TEST_SOURCE }}
+      - name: Complete cold compilation after restore failure
+        env:
+          MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          test -z "$MATCHED"
+          python3 .github/workflows/scripts/validate_nightly_cache_transport.py cold
+      - uses: ./.github/actions/csrc-l1-save
+        with:
+          cache-dir: csrc/build_cache
+          primary-key: ${{ steps.restore.outputs.primary-key }}
+          access-key-id: test-invalid-key
+          secret-access-key: test-invalid-secret
+      - name: Build continues after save failure
+        run: echo "Cache outage retained source-build fallback"
